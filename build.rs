@@ -31,7 +31,10 @@ fn main() {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let logical_path = Path::new(prefix).join(rel).to_string_lossy().to_string();
+                let logical_path = Path::new(prefix)
+                    .join(rel)
+                    .to_string_lossy()
+                    .replace('\\', "/");
 
                 let abs_path = match fs::canonicalize(path) {
                     Ok(v) => v,
