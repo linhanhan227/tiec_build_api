@@ -1,0 +1,10 @@
+.cache
+.tiecode
+lib.json
+/build
+/绳包/安卓基本库
+/源代码/初始代码.t
+.布局
+*.tlb
+project.json
+.DS_Store
