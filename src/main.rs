@@ -29,12 +29,13 @@ use tokio::sync::Mutex;
         api::upload::upload_file,
         api::build::create_build,
         api::build::get_build_status,
+        api::build::get_build_events,
         api::download::download_build,
         api::health::health_check,
         api::cleanup::cleanup_tasks
     ),
     components(
-        schemas(models::Task, models::TaskStatus, models::BuildRequest, models::BuildResponse, models::UploadResponse, api::cleanup::CleanupRequest, api::cleanup::CleanupResponse)
+        schemas(models::Task, models::TaskStatus, models::TaskEvent, models::BuildRequest, models::BuildResponse, models::UploadResponse, api::cleanup::CleanupRequest, api::cleanup::CleanupResponse)
     ),
     tags(
         (name = "tie-api", description = "TieCloud Build API")
@@ -102,7 +103,6 @@ async fn main() -> std::io::Result<()> {
         upload_dir.clone(),
         tiecc_dir.to_string_lossy().to_string(),
         stdlib_dir.to_string_lossy().to_string(),
-        task_queue,
         config.queue_capacity,
         database,
     ));
@@ -154,12 +154,15 @@ async fn main() -> std::io::Result<()> {
         .finish()
         .unwrap();
 
+    let hourly_limiter = middleware::HourlyIpLimiter::new(config.hourly_ip_limit);
+
     HttpServer::new(move || {
         let cors = Cors::permissive(); // For development
         let ip_limiter_clone = ip_limiter.clone();
 
         App::new()
             .wrap(ip_limiter_clone)
+            .wrap(hourly_limiter.clone())
             .wrap(Governor::new(&governor_conf))
             .wrap(cors)
             .wrap(Logger::default())
@@ -170,6 +173,7 @@ async fn main() -> std::io::Result<()> {
                     .service(api::upload::upload_file)
                     .service(api::build::create_build)
                     .service(api::build::get_build_status)
+                        .service(api::build::get_build_events)
                     .service(api::download::download_build)
                     .service(api::cleanup::cleanup_tasks)
             )

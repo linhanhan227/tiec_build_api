@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, Result, OptionalExtension};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::models::{Task, TaskStatus};
+use crate::models::{Task, TaskStatus, TaskEvent};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration};
 
 pub type DbConnection = Arc<Mutex<Connection>>;
 
@@ -86,11 +86,90 @@ impl Database {
             )?;
         }
 
+        if current_version < 2 {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN build_duration INTEGER",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![2, "add_build_duration_column", chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+
+        if current_version < 3 {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![3, "add_task_priority_column", chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+
+        if current_version < 4 {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN next_run_at TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN lease_until TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN locked_by TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN last_error TEXT",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(status, next_run_at, priority, created_at)",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![4, "add_queue_columns", chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+
+        if current_version < 5 {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT,
+                    message TEXT,
+                    worker_id TEXT,
+                    created_at TEXT NOT NULL
+                )",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id)",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_events_created_at ON task_events(created_at)",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![5, "create_task_events_table", chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+
         // Future migrations can be added here
-        // Migration 2: Add new columns
-        // if current_version < 2 {
-        //     // Add migration logic here
-        // }
 
         Ok(())
     }
@@ -142,6 +221,7 @@ impl Database {
                     "处理中" => TaskStatus::Processing,
                     "成功" => TaskStatus::Success,
                     "失败" => TaskStatus::Failed,
+                    "已取消" => TaskStatus::Cancelled,
                     _ => TaskStatus::Failed,
                 },
                 progress: row.get(2)?,
@@ -194,6 +274,214 @@ impl Database {
         Ok(())
     }
 
+    pub async fn enqueue_task(&self, task_id: &Uuid) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET status = ?, next_run_at = ?, lease_until = NULL, locked_by = NULL, updated_at = ? WHERE task_id = ?",
+            rusqlite::params![
+                serde_json::to_string(&TaskStatus::Queued).unwrap(),
+                Utc::now().to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                task_id.to_string(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                task_id.to_string(),
+                "enqueued",
+                serde_json::to_string(&TaskStatus::Queued).unwrap(),
+                "Task enqueued",
+                Option::<String>::None,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn count_queued_tasks(&self) -> Result<u64> {
+        let conn = self.conn.lock().await;
+        let count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status = ?",
+            [serde_json::to_string(&TaskStatus::Queued).unwrap()],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub async fn get_oldest_queued_tasks(&self, limit: u64) -> Result<Vec<Uuid>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM tasks WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+        )?;
+
+        let task_iter = stmt.query_map(
+            rusqlite::params![serde_json::to_string(&TaskStatus::Queued).unwrap(), limit],
+            |row| row.get::<_, String>(0),
+        )?;
+
+        let mut tasks = Vec::new();
+        for task_id in task_iter {
+            let id = task_id?;
+            if let Ok(parsed) = Uuid::parse_str(&id) {
+                tasks.push(parsed);
+            }
+        }
+        Ok(tasks)
+    }
+
+    pub async fn cancel_task(&self, task_id: &Uuid, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET status = ?, error = ?, current_step = ?, updated_at = ?, lease_until = NULL, locked_by = NULL WHERE task_id = ?",
+            rusqlite::params![
+                serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+                reason,
+                "Cancelled",
+                Utc::now().to_rfc3339(),
+                task_id.to_string(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                task_id.to_string(),
+                "cancelled",
+                serde_json::to_string(&TaskStatus::Cancelled).unwrap(),
+                reason,
+                Option::<String>::None,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn lease_next_task(&self, worker_id: &str, lease_secs: u64) -> Result<Option<Uuid>> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let lease_until = (now + Duration::seconds(lease_secs as i64)).to_rfc3339();
+
+        conn.execute("BEGIN IMMEDIATE", [])?;
+
+        let task_id: Option<String> = conn.query_row(
+            "SELECT task_id FROM tasks
+             WHERE status = ? AND (next_run_at IS NULL OR next_run_at <= ?)
+             ORDER BY priority DESC, created_at ASC
+             LIMIT 1",
+            rusqlite::params![serde_json::to_string(&TaskStatus::Queued).unwrap(), now_str],
+            |row| row.get(0),
+        ).optional()?;
+
+        if let Some(id) = task_id {
+            let id_clone = id.clone();
+            let updated = conn.execute(
+                "UPDATE tasks SET status = ?, lease_until = ?, locked_by = ?, updated_at = ?, current_step = ?
+                 WHERE task_id = ? AND status = ?",
+                rusqlite::params![
+                    serde_json::to_string(&TaskStatus::Processing).unwrap(),
+                    lease_until,
+                    worker_id,
+                    now_str,
+                    "Leased",
+                    id,
+                    serde_json::to_string(&TaskStatus::Queued).unwrap(),
+                ],
+            )?;
+
+            if updated == 0 {
+                conn.execute("ROLLBACK", [])?;
+                return Ok(None);
+            }
+
+            conn.execute("COMMIT", [])?;
+            conn.execute(
+                "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    id_clone.clone(),
+                    "leased",
+                    serde_json::to_string(&TaskStatus::Processing).unwrap(),
+                    "Task leased",
+                    worker_id,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            return Ok(Uuid::parse_str(&id_clone).ok());
+        }
+
+        conn.execute("COMMIT", [])?;
+        Ok(None)
+    }
+
+    pub async fn refresh_lease(&self, task_id: &Uuid, worker_id: &str, lease_secs: u64) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let lease_until = (Utc::now() + Duration::seconds(lease_secs as i64)).to_rfc3339();
+        conn.execute(
+            "UPDATE tasks SET lease_until = ?, updated_at = ? WHERE task_id = ? AND locked_by = ?",
+            rusqlite::params![lease_until, Utc::now().to_rfc3339(), task_id.to_string(), worker_id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn clear_lease(&self, task_id: &Uuid) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET lease_until = NULL, locked_by = NULL WHERE task_id = ?",
+            rusqlite::params![task_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub async fn schedule_retry(&self, task_id: &Uuid, next_run_at: DateTime<Utc>, last_error: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE tasks SET status = ?, next_run_at = ?, last_error = ?, updated_at = ?, lease_until = NULL, locked_by = NULL WHERE task_id = ?",
+            rusqlite::params![
+                serde_json::to_string(&TaskStatus::Queued).unwrap(),
+                next_run_at.to_rfc3339(),
+                last_error,
+                Utc::now().to_rfc3339(),
+                task_id.to_string(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                task_id.to_string(),
+                "retry_scheduled",
+                serde_json::to_string(&TaskStatus::Queued).unwrap(),
+                last_error,
+                Option::<String>::None,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn insert_task_event(
+        &self,
+        task_id: &Uuid,
+        event_type: &str,
+        status: Option<TaskStatus>,
+        message: Option<&str>,
+        worker_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let status_str = status.map(|s| serde_json::to_string(&s).unwrap());
+        conn.execute(
+            "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                task_id.to_string(),
+                event_type,
+                status_str,
+                message,
+                worker_id,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub async fn delete_task(&self, task_id: &Uuid) -> Result<()> {
         let conn = self.conn.lock().await;
@@ -218,6 +506,7 @@ impl Database {
                     "处理中" => TaskStatus::Processing,
                     "成功" => TaskStatus::Success,
                     "失败" => TaskStatus::Failed,
+                    "已取消" => TaskStatus::Cancelled,
                     _ => TaskStatus::Failed,
                 },
                 progress: row.get(2)?,
@@ -247,6 +536,50 @@ impl Database {
         Ok(tasks)
     }
 
+    pub async fn get_task_events(&self, task_id: &Uuid, limit: u64, offset: u64) -> Result<Vec<TaskEvent>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, event_type, status, message, worker_id, created_at
+             FROM task_events
+             WHERE task_id = ?
+             ORDER BY created_at ASC
+             LIMIT ? OFFSET ?",
+        )?;
+
+        let event_iter = stmt.query_map(
+            rusqlite::params![task_id.to_string(), limit, offset],
+            |row| {
+                let status_str: Option<String> = row.get(3)?;
+                let status = status_str.as_deref().map(|s| match s {
+                    "排队中" => TaskStatus::Queued,
+                    "处理中" => TaskStatus::Processing,
+                    "成功" => TaskStatus::Success,
+                    "失败" => TaskStatus::Failed,
+                    "已取消" => TaskStatus::Cancelled,
+                    _ => TaskStatus::Failed,
+                });
+
+                Ok(TaskEvent {
+                    id: row.get(0)?,
+                    task_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                    event_type: row.get(2)?,
+                    status,
+                    message: row.get(4)?,
+                    worker_id: row.get(5)?,
+                    created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                })
+            },
+        )?;
+
+        let mut events = Vec::new();
+        for event in event_iter {
+            events.push(event?);
+        }
+        Ok(events)
+    }
+
     #[allow(dead_code)]
     pub async fn get_tasks_by_status(&self, status: TaskStatus) -> Result<Vec<Task>> {
         let conn = self.conn.lock().await;
@@ -265,6 +598,7 @@ impl Database {
                     "处理中" => TaskStatus::Processing,
                     "成功" => TaskStatus::Success,
                     "失败" => TaskStatus::Failed,
+                    "已取消" => TaskStatus::Cancelled,
                     _ => TaskStatus::Failed,
                 },
                 progress: row.get(2)?,
@@ -416,6 +750,71 @@ impl Database {
             )?;
 
             applied_migrations.push("add_task_priority_column".to_string());
+        }
+
+        // Migration 4: Add queue/lease columns
+        if current_version < 4 {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN next_run_at TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN lease_until TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN locked_by TEXT",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN last_error TEXT",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(status, next_run_at, priority, created_at)",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![4, "add_queue_columns", chrono::Utc::now().to_rfc3339()],
+            )?;
+
+            applied_migrations.push("add_queue_columns".to_string());
+        }
+
+        // Migration 5: Add task events table
+        if current_version < 5 {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT,
+                    message TEXT,
+                    worker_id TEXT,
+                    created_at TEXT NOT NULL
+                )",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id)",
+                [],
+            )?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_task_events_created_at ON task_events(created_at)",
+                [],
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                rusqlite::params![5, "create_task_events_table", chrono::Utc::now().to_rfc3339()],
+            )?;
+
+            applied_migrations.push("create_task_events_table".to_string());
         }
 
         Ok(applied_migrations)

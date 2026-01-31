@@ -13,6 +13,8 @@ use std::sync::atomic::Ordering;
 
 async fn update_task_status(data: &Arc<AppState>, task_id: &Uuid, status: TaskStatus, progress: u8, current_step: Option<String>, error: Option<String>) {
     if let Some(mut task) = data.tasks.get_mut(task_id) {
+        let status_clone = status.clone();
+        let message = error.clone().or_else(|| current_step.clone());
         task.status = status;
         task.progress = progress;
         task.current_step = current_step;
@@ -34,23 +36,40 @@ async fn update_task_status(data: &Arc<AppState>, task_id: &Uuid, status: TaskSt
         if let Err(e) = data.database.update_task(&task).await {
             log::error!("Failed to update task in database: {}", e);
         }
+
+        if let Err(e) = data.database.insert_task_event(task_id, "status_change", Some(status_clone), message.as_deref(), None).await {
+            log::warn!("Failed to write task event for {}: {}", task_id, e);
+        }
+
+        if task.status != TaskStatus::Processing {
+            if let Err(e) = data.database.clear_lease(task_id).await {
+                log::warn!("Failed to clear lease for task {}: {}", task_id, e);
+            }
+        }
     }
 }
 
-pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<VecDeque<Uuid>>>, worker_id: usize, task_timeout: u64) {
-    log::info!("Worker {} started", worker_id);
-    loop {
-        // Try to get a task from the queue
-        let task_id = {
-            let mut queue = task_queue.lock().await;
-            queue.pop_front()
-        };
+async fn stop_lease(data: &Arc<AppState>, task_id: &Uuid, lease_handle: &tokio::task::JoinHandle<()>) {
+    lease_handle.abort();
+    if let Err(e) = data.database.clear_lease(task_id).await {
+        log::warn!("Failed to clear lease for task {}: {}", task_id, e);
+    }
+}
 
-        let task_id = match task_id {
-            Some(id) => id,
-            None => {
-                // No task available, wait a bit and try again
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex<VecDeque<Uuid>>>, worker_id: usize, task_timeout: u64) {
+    log::info!("Worker {} started", worker_id);
+    let worker_id_str = format!("worker-{}", worker_id);
+    let lease_refresh_secs = std::cmp::max(5, task_timeout / 2);
+    loop {
+        let task_id = match data.database.lease_next_task(&worker_id_str, task_timeout + 60).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+            Err(e) => {
+                log::error!("Failed to lease task: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
         };
@@ -58,6 +77,19 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
 // (I need to be careful not to delete the existing code, I'll use append or smart replace. 
 //  Since I cannot easily append, I will add the function at the END of the file or replacing the end of file)
         log::info!("Processing task: {}", task_id);
+
+        let lease_task_id = task_id;
+        let lease_data = data.clone();
+        let lease_worker = worker_id_str.clone();
+        let lease_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(lease_refresh_secs));
+            loop {
+                interval.tick().await;
+                if let Err(e) = lease_data.database.refresh_lease(&lease_task_id, &lease_worker, task_timeout + 60).await {
+                    log::warn!("Failed to refresh lease for task {}: {}", lease_task_id, e);
+                }
+            }
+        });
         
         // 1. Update status to Processing
         update_task_status(&data, &task_id, TaskStatus::Processing, 5, Some("Initializing environment".into()), None).await;
@@ -66,6 +98,7 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
         let (file_path, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
             (task.file_path.clone(), task.user_id.clone())
         } else {
+            stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         };
 
@@ -80,6 +113,7 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
 
             if let Err(e) = fs::create_dir_all(&unzip_dir).await {
                 fail_task(&data, task_id, format!("Failed to create source dir: {}", e)).await;
+                stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
 
@@ -101,6 +135,7 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
                 Ok(Ok(_)) => {},
                 _ => {
                     fail_task(&data, task_id, "Failed to extract project".into()).await;
+                    stop_lease(&data, &task_id, &lease_handle).await;
                     continue;
                 }
             }
@@ -118,6 +153,7 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
         };
         if let Some(err_msg) = asset_err {
             fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg)).await;
+            stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
 
@@ -133,12 +169,14 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
             ("windows", "x86_64") => tiecc_root.join("win_x86_64/tiec.exe"),
             _ => {
                 fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch)).await;
+                stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
         };
 
         if !binary_path.exists() {
             fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display())).await;
+            stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
 
@@ -176,6 +214,7 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
             Ok(c) => c,
             Err(e) => {
                 fail_task(&data, task_id, format!("Failed to spawn builder: {}", e)).await;
+                stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
         };
@@ -232,6 +271,8 @@ pub async fn run_worker(data: Arc<AppState>, task_queue: Arc<tokio::sync::Mutex<
                 fail_task(&data, task_id, "Build timed out".into()).await;
             }
         }
+
+        stop_lease(&data, &task_id, &lease_handle).await;
         
         // Clean up uploads/work dir if needed (user requirement 1 mentioned cleanup task, 
         // but here we might want to keep output? "output_dir" should persist for download)
@@ -263,6 +304,12 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String) {
             task.error = Some(format!("Previous attempt failed: {}. Retrying...", error));
             task.updated_at = Utc::now();
 
+            let backoff_secs = compute_retry_delay_seconds(task.retry_count);
+            let next_run_at = Utc::now() + chrono::Duration::seconds(backoff_secs);
+            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
+                log::error!("Failed to schedule retry in database: {}", e);
+            }
+
             // Save retry state to database
             if let Err(e) = data.database.update_task(&task).await {
                 log::error!("Failed to update retry state in database: {}", e);
@@ -270,15 +317,30 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String) {
 
             log::info!("Retrying task {} (attempt {}/{})", task_id, task.retry_count, task.max_retries);
 
-            // Re-queue the task
-            data.enqueue_task(task_id, data.queue_capacity).await;
-            update_task_status(data, &task_id, TaskStatus::Queued, 0, Some(format!("Retrying (attempt {}/{})", task.retry_count, task.max_retries)), task.error.clone()).await;
+            // Re-queue the task with backoff
+            data.enforce_queue_capacity(data.queue_capacity).await;
+            update_task_status(
+                data,
+                &task_id,
+                TaskStatus::Queued,
+                0,
+                Some(format!("Retrying in {}s (attempt {}/{})", backoff_secs, task.retry_count, task.max_retries)),
+                task.error.clone(),
+            ).await;
         } else {
             // Max retries reached, mark as failed
             update_task_status(data, &task_id, TaskStatus::Failed, task.progress, Some("Build failed".into()), Some(format!("Task failed after {} attempts. Last error: {}", task.max_retries, error))).await;
             log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
         }
     }
+}
+
+fn compute_retry_delay_seconds(retry_count: u8) -> i64 {
+    let base = 5_i64;
+    let exp = 2_i64.saturating_pow(retry_count as u32);
+    let max_delay = 300_i64;
+    let jitter = (Utc::now().timestamp_subsec_millis() as i64) % 10;
+    (base.saturating_mul(exp)).min(max_delay) + jitter
 }
 
 pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64) {

@@ -7,6 +7,7 @@ pub struct Config {
     pub worker_count: usize,
     pub task_timeout: u64,
     pub cleanup_interval: u64,
+    pub hourly_ip_limit: u32,
 }
 
 impl Config {
@@ -32,6 +33,10 @@ impl Config {
                 .unwrap_or_else(|_| "3600".into())
                 .parse()
                 .unwrap_or(3600),
+            hourly_ip_limit: std::env::var("HOURLY_IP_LIMIT")
+                .unwrap_or_else(|_| "20".into())
+                .parse()
+                .unwrap_or(20),
         }
     }
 }

@@ -8,16 +8,12 @@ use uuid::Uuid;
 pub type TaskSender = mpsc::Sender<Uuid>;
 
 use std::sync::atomic::AtomicU64;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 pub struct AppState {
     pub tasks: dashmap::DashMap<Uuid, Task>, // Keep in-memory cache for performance
     pub upload_dir: String,
     pub tiecc_dir: String,
     pub stdlib_dir: String,
-    pub task_queue: Arc<Mutex<VecDeque<Uuid>>>, // Shared task queue
     pub queue_capacity: usize, // Maximum queue size
     pub database: Database,
     // Statistics (cached, updated from DB periodically)
@@ -32,13 +28,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(upload_dir: String, tiecc_dir: String, stdlib_dir: String, task_queue: Arc<Mutex<VecDeque<Uuid>>>, queue_capacity: usize, database: Database) -> Self {
+    pub fn new(upload_dir: String, tiecc_dir: String, stdlib_dir: String, queue_capacity: usize, database: Database) -> Self {
         AppState {
             tasks: dashmap::DashMap::new(),
             upload_dir,
             tiecc_dir,
             stdlib_dir,
-            task_queue,
             queue_capacity,
             database,
             total_tasks: AtomicU64::new(0),
@@ -70,34 +65,50 @@ impl AppState {
     }
 
     pub async fn enqueue_task(&self, task_id: Uuid, max_queue_size: usize) {
-        let mut queue = self.task_queue.lock().await;
-        
-        // If queue is full, remove the first 60 tasks
-        while queue.len() >= max_queue_size {
-            for _ in 0..60 {
-                if let Some(old_task_id) = queue.pop_front() {
-                    // Cancel the old task
-                    if let Some(mut task) = self.tasks.get_mut(&old_task_id) {
-                        task.status = crate::models::TaskStatus::Cancelled;
-                        task.error = Some("Cancelled due to queue overflow".into());
-                        task.updated_at = chrono::Utc::now();
-                        log::warn!("Cancelled task {} due to queue overflow", old_task_id);
-                        
-                        // Update database
-                        let task_clone = task.clone();
-                        let db = self.database.clone();
-                        tokio::spawn(async move {
-                            let _ = db.update_task(&task_clone).await;
-                        });
+        if let Some(mut task) = self.tasks.get_mut(&task_id) {
+            task.status = crate::models::TaskStatus::Queued;
+            task.current_step = Some("Queued".into());
+            task.updated_at = chrono::Utc::now();
+        }
+
+        self.enforce_queue_capacity(max_queue_size).await;
+
+        if let Err(e) = self.database.enqueue_task(&task_id).await {
+            log::error!("Failed to enqueue task {}: {}", task_id, e);
+        }
+    }
+
+    pub async fn enforce_queue_capacity(&self, max_queue_size: usize) {
+        let mut queued_count = match self.database.count_queued_tasks().await {
+            Ok(count) => count as usize,
+            Err(e) => {
+                log::error!("Failed to count queued tasks: {}", e);
+                return;
+            }
+        };
+
+        if queued_count >= max_queue_size {
+            let overflow = (queued_count + 1).saturating_sub(max_queue_size).max(1);
+            match self.database.get_oldest_queued_tasks(overflow as u64).await {
+                Ok(old_tasks) => {
+                    for old_task_id in old_tasks {
+                        if let Some(mut task) = self.tasks.get_mut(&old_task_id) {
+                            task.status = crate::models::TaskStatus::Cancelled;
+                            task.error = Some("Cancelled due to queue overflow".into());
+                            task.updated_at = chrono::Utc::now();
+                            log::warn!("Cancelled task {} due to queue overflow", old_task_id);
+                        }
+                        if let Err(e) = self.database.cancel_task(&old_task_id, "Cancelled due to queue overflow").await {
+                            log::error!("Failed to cancel task {}: {}", old_task_id, e);
+                        }
+                        queued_count = queued_count.saturating_sub(1);
                     }
-                } else {
-                    break;
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch queued tasks for overflow handling: {}", e);
                 }
             }
         }
-        
-        // Add the new task
-        queue.push_back(task_id);
     }
 
     pub fn ensure_assets_extracted(&self) -> Result<(), Box<dyn std::error::Error>> {

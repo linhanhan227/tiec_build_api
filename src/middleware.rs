@@ -285,3 +285,103 @@ where
         })
     }
 }
+
+#[derive(Clone)]
+pub struct HourlyIpLimiter {
+    limit_per_hour: u32,
+    request_counts: Arc<RwLock<HashMap<String, (u32, u64)>>>,
+}
+
+impl HourlyIpLimiter {
+    pub fn new(limit_per_hour: u32) -> Self {
+        Self {
+            limit_per_hour,
+            request_counts: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn check_and_update(&self, ip: &str) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let window_id = now / 3600;
+
+        let mut request_counts = self.request_counts.write().await;
+        let entry = request_counts.entry(ip.to_string()).or_insert((0, window_id));
+
+        if entry.1 != window_id {
+            *entry = (1, window_id);
+            return true;
+        }
+
+        entry.0 += 1;
+        entry.0 <= self.limit_per_hour
+    }
+}
+
+pub struct HourlyIpLimiterMiddleware<S> {
+    service: S,
+    limiter: HourlyIpLimiter,
+}
+
+impl<S, B> Transform<S, ServiceRequest> for HourlyIpLimiter
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type InitError = ();
+    type Transform = HourlyIpLimiterMiddleware<S>;
+    type Future = Ready<Result<Self::Transform, Self::InitError>>;
+
+    fn new_transform(&self, service: S) -> Self::Future {
+        ready(Ok(HourlyIpLimiterMiddleware {
+            service,
+            limiter: self.clone(),
+        }))
+    }
+}
+
+impl<S, B> Service<ServiceRequest> for HourlyIpLimiterMiddleware<S>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S::Future: 'static,
+    B: 'static,
+{
+    type Response = ServiceResponse<B>;
+    type Error = Error;
+    type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    forward_ready!(service);
+
+    fn call(&self, req: ServiceRequest) -> Self::Future {
+        let limiter = self.limiter.clone();
+        let ip = req
+            .connection_info()
+            .peer_addr()
+            .unwrap_or("unknown")
+            .to_string();
+
+        let path = req.path().to_string();
+        let method = req.method().clone();
+        let fut = self.service.call(req);
+
+        Box::pin(async move {
+            let limited = (path.starts_with("/api/v1/upload") && method == actix_web::http::Method::POST)
+                || (path.starts_with("/api/v1/build") && method == actix_web::http::Method::POST)
+                || (path.starts_with("/api/v1/build/") && (method == actix_web::http::Method::GET));
+
+            if limited && !limiter.check_and_update(&ip).await {
+                return Err(actix_web::error::ErrorTooManyRequests(serde_json::json!({
+                    "error": "Hourly rate limit exceeded",
+                    "message": "Too many requests from this IP. Max 20 requests per hour.",
+                    "limit": 20,
+                    "window": "1h"
+                })));
+            }
+
+            let res = fut.await?;
+            Ok(res)
+        })
+    }
+}

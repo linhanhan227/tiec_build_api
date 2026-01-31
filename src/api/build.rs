@@ -2,7 +2,7 @@ use actix_web::{get, post, web, Responder, HttpRequest};
 use uuid::Uuid;
 use chrono::Utc;
 use crate::state::AppState;
-use crate::models::{BuildRequest, BuildResponse, Task, TaskStatus};
+use crate::models::{BuildRequest, BuildResponse, Task, TaskStatus, TaskEvent};
 use crate::error::ApiError;
 use crate::utils::{json_response, accepted_json_response};
 use std::sync::atomic::Ordering;
@@ -97,4 +97,47 @@ pub async fn get_build_status(
     } else {
         Err(ApiError::NotFound("Task not found".into()))
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/build/{id}/events",
+    params(
+        ("id" = String, Path, description = "Task ID"),
+        ("limit" = Option<u64>, Query, description = "Max events to return (default 50)") ,
+        ("offset" = Option<u64>, Query, description = "Offset for pagination (default 0)")
+    ),
+    responses(
+        (status = 200, description = "Task events", body = [TaskEvent]),
+        (status = 404, description = "Task not found")
+    )
+)]
+#[get("/build/{id}/events")]
+pub async fn get_build_events(
+    _req: HttpRequest,
+    task_id_path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+    data: web::Data<AppState>,
+) -> Result<impl Responder, ApiError> {
+    let task_id_str = task_id_path.into_inner();
+    let task_id = Uuid::parse_str(&task_id_str).map_err(|_| ApiError::BadRequest("Invalid Task ID".into()))?;
+
+    if data.tasks.get(&task_id).is_none() {
+        return Err(ApiError::NotFound("Task not found".into()));
+    }
+
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(50)
+        .min(200);
+    let offset = query
+        .get("offset")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let events = data.database.get_task_events(&task_id, limit, offset).await
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    Ok(json_response(events))
 }

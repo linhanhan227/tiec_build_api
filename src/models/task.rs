@@ -39,6 +39,17 @@ pub struct Task {
     pub user_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TaskEvent {
+    pub id: i64,
+    pub task_id: Uuid,
+    pub event_type: String,
+    pub status: Option<TaskStatus>,
+    pub message: Option<String>,
+    pub worker_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UploadResponse {
     pub file_id: String,
