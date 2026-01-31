@@ -18,9 +18,9 @@ impl Config {
             upload_dir: std::env::var("UPLOAD_DIR").unwrap_or_else(|_| "./.tiec/uploads".into()),
             database_path: std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./.tiec/tasks.db".into()),
             queue_capacity: std::env::var("QUEUE_CAPACITY")
-                .unwrap_or_else(|_| "100".into())
+                .unwrap_or_else(|_| "15".into())
                 .parse()
-                .unwrap_or(100),
+                .unwrap_or(15),
             worker_count: std::env::var("WORKER_COUNT")
                 .unwrap_or_else(|_| "1".into())
                 .parse()

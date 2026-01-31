@@ -121,7 +121,7 @@ INFO  tie_api_server > Database initialized at ./.tiec/tasks.db
 | `UPLOAD_DIR` | `./.tiec/uploads` | 上传文件临时存储路径 |
 | `DATABASE_PATH` | `./.tiec/tasks.db` | SQLite 数据库文件路径 |
 | `WORKER_COUNT` | `1` | 并发构建工作线程数（建议设置为 CPU 核心数 / 2） |
-| `QUEUE_CAPACITY` | `100` | 等待队列最大容量 |
+| `QUEUE_CAPACITY` | `15` | 等待队列最大容量 |
 | `TASK_TIMEOUT` | `900` | 单个任务超时时间（秒，默认15分钟） |
 | `HOURLY_IP_LIMIT` | `20` | 上传/构建相关接口每小时每IP最大请求数 |
 | `RUST_LOG` | `info` | 日志级别 (debug, info, warn, error) |
