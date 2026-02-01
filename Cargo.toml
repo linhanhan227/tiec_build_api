@@ -1,0 +1,46 @@
+[package]
+name = "tie_api_server"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+walkdir = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dependencies]
+actix-web = "4.9"
+actix-cors = "0.7"
+actix-files = "0.6"
+actix-multipart = "0.7"
+actix-rt = "2.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+utoipa = { version = "5.3", features = ["actix_extras", "uuid", "chrono"] }
+utoipa-swagger-ui = { version = "8.1", features = ["actix-web"] }
+zip = "2.2"
+mime = "0.3"
+mime_guess = "2.0"
+dashmap = "6.1"
+thiserror = "2.0"
+futures = "0.3"
+base64 = "0.22"
+walkdir = "2.5"
+bytes = "1.9"
+tempfile = "3.16"
+wait-timeout = "0.2"
+derive_more = "0.99"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+actix-governor = "0.5"
+rand = "0.8"
+sha1 = "0.10"
+
+[target.'cfg(not(windows))'.dependencies]
+get_if_addrs = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+ipconfig = "0.3"

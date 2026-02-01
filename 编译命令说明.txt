@@ -1,0 +1,59 @@
+使用命令行工具
+
+用法：
+
+tiec.exe [选项] <源文件...>
+编译选项：
+
+  -o, --output <目录>                     设置输出目录
+  -p, --package <包名>                    设置默认包名
+  -d, --define <宏名称>=<值>               定义编译条件变量
+  --dir <目录>                            递归扫描指定目录下所有源文件
+  --source <版本>                         结绳源代码版本 (40, 46, 47)
+  --debug                                启用调试模式（默认）
+  --release                              发布模式（禁用调试）
+  --hard-mode                            硬输出模式
+  --enable-toplevel-stmt                 开启顶级语句语法特性支持
+  --profile <模式>                        编译器部署模式 (standard, designer)
+  --optimize <级别>                       优化级别 (0-3，默认1)
+  --disable-lint <名称>                   禁用指定lint检查
+  --log-level <级别>                      日志级别 (debug, info, warning, error)
+  --platform <平台>                       目标平台 (android, harmony, linux, windows, ios, apple, html)
+  --friendly-name <模式>                  指定编译输出符号名称模式 (random, pinyin, original)
+  --emit-names <路径>                     指定生成稳定的输出名并将映射表保存到指定文件，配合--stable-names使用
+  --stable-names <路径>                   从指定路径读取稳定名称映射表保证输出名称与上一次一致，配合--emit-names使用
+  --search-lib-prefix <路径>              增加外部依赖库搜寻路径
+  --search-source-prefix <路径>           增加外部源文件搜寻路径
+  --search-res-prefix <路径>              增加资源文件搜寻路径
+  --search-assets-prefix <路径>           增加资产文件搜寻路径
+  --line-map <路径>                       行号表输出路径
+  --retrace <行号表路径> <文件名> <行号>     还原结绳源代码行号
+  --android.app.config <文件路径>          指定输出Android工程的App配置信息（App名称、targetSdkVersion等）
+  --android.gradle                       指定Android工程输出格式为gradle工程
+  -h, --help                             显示此帮助信息
+特别说明：
+-d, --define 选项用于定义编译条件变量，默认的变量有以下两个:
+
+调试版=真/假
+正式版=假/真
+--android.app.config 指定的文件内容格式（JSON）如下：
+
+{
+  "appName": "App的名称",
+  "appIcon": "App的启动图标路径",
+  "minSdk": minSdkVersion,
+  "targetSdk": targetSdkVersion,
+  "versionCode": 版本号,
+  "versionName": "版本名称"
+}
+示例：
+
+tiec.exe -o output/ -p 结绳.中文 --platform windows src/main.t src/std.t
+
+
+
+
+本项目使用的命令行参数：
+
+说明：
+./tiec -o /build --platform android --android.gradle --android.app.config build/project.json --release  --log-level error --dir 源文件目录....
