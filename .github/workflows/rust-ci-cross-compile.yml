@@ -100,6 +100,7 @@ jobs:
       if: github.event_name == 'release'
       uses: softprops/action-gh-release@v2  # 升级到 v2
       with:
+        name: 全平台架构构建-${{ github.event.release.published_at }}
         files: |
           ${{ env.BINARY_NAME }}-${{ matrix.asset_suffix }}.tar.gz
           ${{ env.BINARY_NAME }}-${{ matrix.asset_suffix }}.tar.gz.sha256
@@ -193,6 +194,7 @@ jobs:
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2  # 升级到 v2
         with:
+          name: 全平台架构构建-${{ github.event.release.published_at }}
           files: |
             ${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}.zip
             ${{ env.BINARY_NAME }}-windows-${{ matrix.arch }}.zip.sha256
@@ -250,6 +252,7 @@ jobs:
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2  # 升级到 v2
         with:
+          name: 全平台架构构建-$(date -u +'%Y%m%d%H%M')
           files: |
             ${{ env.BINARY_NAME }}-darwin-${{ matrix.arch }}.tar.gz
             ${{ env.BINARY_NAME }}-darwin-${{ matrix.arch }}.tar.gz.sha256
