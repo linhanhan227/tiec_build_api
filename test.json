@@ -3,7 +3,7 @@
   "file_path": "/Users/linshaochun/Downloads/热更新例子(2).tsp",
   "file_paths": ["/Users/linshaochun/Downloads/热更新例子(2).tsp", "/Users/linshaochun/Downloads/编辑框闪屏解决事例.tsp"],
   "interval_ms": 200,
-  "task_timeout": 60,
+  "task_timeout": 10,
   "queue_capacity": 5,
   "cleanup_interval": 30,
   "cleanup_retention_secs": 15,

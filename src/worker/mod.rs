@@ -299,132 +299,106 @@ async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step
 
 async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_status: TaskStatus) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
-        if task.retry_count < task.max_retries {
-            // Retry the task
-            task.retry_count += 1;
-            task.error = Some(format!("Previous attempt failed: {}. Retrying...", error));
-            task.updated_at = Utc::now();
+        // Retry logic:
+        // - Only retry if status is NOT CompilationFailed (user request: compile fail -> mark fail directly)
+        // - Only retry if retry_count < max_retries
+        let should_retry = final_status != TaskStatus::CompilationFailed && task.retry_count < task.max_retries;
 
+        if should_retry {
+            // Increment retry count
+            task.retry_count += 1;
             let backoff_secs = compute_retry_delay_seconds(task.retry_count);
             let next_run_at = Utc::now() + chrono::Duration::seconds(backoff_secs);
-                if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
-                log::error!("Failed to schedule retry in database: {}", e);
-            }
-
-            // Save retry state to database
-            if let Err(e) = data.database.update_task(&task).await {
-                log::error!("Failed to update retry state in database: {}", e);
-            }
-
-            log::info!(
-                "Retrying task {} (attempt {}/{}), next_run_at={} ({}s)",
-                task_id,
-                task.retry_count,
-                task.max_retries,
-                next_run_at.to_rfc3339(),
-                backoff_secs
-            );
-
-            let countdown_task_id = task_id;
-            let countdown_secs = backoff_secs.max(1) as u64;
-            let countdown_data = data.clone();
-            tokio::spawn(async move {
-                log::info!("倒计时开始：任务 {}，总计 {} 秒", countdown_task_id, countdown_secs);
-                let mut remaining = countdown_secs;
-                let step = if countdown_secs > 10 { 5 } else { 1 };
-                while remaining > 0 {
-                    log::info!("倒计时重试：任务 {} 剩余 {} 秒", countdown_task_id, remaining);
-                    if let Err(e) = countdown_data
-                        .database
-                        .insert_task_event(
-                            &countdown_task_id,
-                            "retry_countdown",
-                            Some(TaskStatus::Queued),
-                            Some(&format!("倒计时重试：剩余 {} 秒", remaining)),
-                            None,
-                        )
-                        .await
-                    {
-                        log::warn!("倒计时事件写入失败 {}: {}", countdown_task_id, e);
-                    }
-                    let sleep_for = std::cmp::min(step, remaining);
-                    tokio::time::sleep(std::time::Duration::from_secs(sleep_for)).await;
-                    remaining = remaining.saturating_sub(sleep_for);
-                }
-                log::info!("倒计时结束：任务 {}，等待重试调度", countdown_task_id);
-                if let Err(e) = countdown_data
-                    .database
-                    .insert_task_event(
-                        &countdown_task_id,
-                        "retry_countdown_done",
-                        Some(TaskStatus::Queued),
-                        Some("倒计时结束，等待重试调度"),
-                        None,
-                    )
-                    .await
-                {
-                    log::warn!("倒计时结束事件写入失败 {}: {}", countdown_task_id, e);
-                }
-            });
-
-            // Re-queue the task with backoff
-            // Skipped enforce_queue_capacity to avoid potential deadlock and prioritize retries
             
-            // INLINED update_task_status LOGIC TO AVOID DEADLOCK
+            let retry_msg = format!("Retry {}/{}: scheduled in {}s. Error: {}", 
+                                    task.retry_count, task.max_retries, backoff_secs, error);
+            
+            // Update in-memory state
             task.status = TaskStatus::Queued;
             task.progress = 0;
-            task.current_step = Some(format!("Retrying in {}s (attempt {}/{})", backoff_secs, task.retry_count, task.max_retries));
+            task.current_step = Some(format!("Waiting for retry (backoff {}s)", backoff_secs));
+            task.error = Some(retry_msg.clone());
             task.updated_at = Utc::now();
             
-            // Save to database
-            if let Err(e) = data.database.update_task(&task).await {
-                log::error!("Failed to update task in database: {}", e);
+            log::info!("Task {} scheduled for retry (attempt {}/{}) at {} (in {}s)", 
+                       task_id, task.retry_count, task.max_retries, next_run_at, backoff_secs);
+
+            // Update database (schedules retry and clears lease)
+            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
+                log::error!("Failed to schedule retry for task {}: {}", task_id, e);
             }
             
-            // Write event
-            if let Err(e) = data.database.insert_task_event(&task_id, "status_change", Some(TaskStatus::Queued), task.error.as_deref(), None).await {
-                log::warn!("Failed to write task event for {}: {}", task_id, e);
-            }
-
-            // Clear lease
-            if let Err(e) = data.database.clear_lease(&task_id).await {
-                log::warn!("Failed to clear lease for task {}: {}", task_id, e);
+            // Also update the task definition in DB to persist retry_count and such
+            if let Err(e) = data.database.update_task(&task).await {
+                log::error!("Failed to update task retry state for {}: {}", task_id, e);
             }
 
         } else {
-            // Max retries reached, mark as failed
-            // INLINED update_task_status LOGIC TO AVOID DEADLOCK
-            let is_timeout = match final_status {
-                TaskStatus::Timeout => true,
-                _ => false
-            };
+            // Max retries reached, mark as permanently failed
+            log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
+
+            let is_timeout = matches!(final_status, TaskStatus::Timeout);
+            // User requested specific error messages for API response
+            let failed_msg = if is_timeout { "任务超时，请重新上传打包" } else { "任务失败" };
             
             task.status = final_status.clone();
-            
-            let failed_msg = if is_timeout { "Build failed (Timeout)" } else { "Build failed" };
             task.current_step = Some(failed_msg.into());
-            task.error = Some(format!("Task failed after {} attempts. Last error: {}", task.max_retries, error));
+            task.error = Some(failed_msg.into()); 
             task.updated_at = Utc::now();
             
             // Update stats
             data.failed_tasks.fetch_add(1, Ordering::Relaxed);
 
-            // Save to database
+            // Save final state to database
             if let Err(e) = data.database.update_task(&task).await {
-                log::error!("Failed to update task in database: {}", e);
+                log::error!("Failed to update task failure in database: {}", e);
             }
 
-            // Write event
-            if let Err(e) = data.database.insert_task_event(&task_id, "status_change", Some(final_status), task.error.as_deref(), None).await {
-                log::warn!("Failed to write task event for {}: {}", task_id, e);
+            // Write failure event
+            if let Err(e) = data.database.insert_task_event(&task_id, "failed", Some(final_status), task.error.as_deref(), None).await {
+                log::warn!("Failed to write task failure event for {}: {}", task_id, e);
             }
 
-            // Clear lease
+            // Clear lease to allow cleanup or inspection (though lease strictly is for processing)
             if let Err(e) = data.database.clear_lease(&task_id).await {
                 log::warn!("Failed to clear lease for task {}: {}", task_id, e);
             }
 
-            log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
+            // Cleanup related files immediately for failed tasks (keep record for API query)
+            let file_path = task.file_path.clone();
+            let upload_dir = data.upload_dir.clone();
+            let _db = data.database.clone();
+            let task_id_clone = task_id;
+            
+            tokio::spawn(async move {
+                log::info!("Cleaning up files for failed/timeout task {}", task_id_clone);
+                let path = std::path::Path::new(&file_path);
+                
+                // 1. Remove original uploaded file
+                if path.exists() {
+                    let res = if path.is_dir() {
+                        tokio::fs::remove_dir_all(path).await
+                    } else {
+                        tokio::fs::remove_file(path).await
+                    };
+                    if let Err(e) = res {
+                        log::warn!("Failed to delete task file {}: {}", path.display(), e);
+                    }
+                }
+
+                // 2. Remove extracted directory
+                if !path.is_dir() {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                         let extract_dir = format!("{}/{}_extracted", upload_dir, stem);
+                         let extract_path = std::path::Path::new(&extract_dir);
+                         if extract_path.exists() {
+                             if let Err(e) = tokio::fs::remove_dir_all(extract_path).await {
+                                 log::warn!("Failed to delete extracted dir {}: {}", extract_dir, e);
+                             }
+                         }
+                    }
+                }
+            });
         }
     }
 }
