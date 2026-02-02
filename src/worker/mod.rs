@@ -26,7 +26,7 @@ async fn update_task_status(data: &Arc<AppState>, task_id: &Uuid, status: TaskSt
             TaskStatus::Success => {
                 data.completed_tasks.fetch_add(1, Ordering::Relaxed);
             }
-            TaskStatus::Failed => {
+            TaskStatus::UnknownError | TaskStatus::Timeout | TaskStatus::CompilationFailed => {
                 data.failed_tasks.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
@@ -95,21 +95,13 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         update_task_status(&data, &task_id, TaskStatus::Processing, 5, Some("Initializing environment".into()), None).await;
 
         // 2. Prepare paths
-        let (file_path, file_id, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
+        let (file_path, _file_id, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
             (task.file_path.clone(), task.file_id.clone(), task.user_id.clone())
         } else {
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         };
 
-        if file_id.starts_with("build-test-") {
-            log::info!("build-test 任务已被真实队列租约：{}", task_id);
-            update_progress(&data, task_id, 50, "build-test 队列验证进行中...").await;
-            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("build-test 队列验证成功".into()), None).await;
-            log::info!("build-test 任务完成：{}", task_id);
-            stop_lease(&data, &task_id, &lease_handle).await;
-            continue;
-        }
 
         let mut project_dir = file_path.clone();
 
@@ -121,7 +113,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             let unzip_dir = format!("{}/{}_extracted", data.upload_dir, file_stem);
 
             if let Err(e) = fs::create_dir_all(&unzip_dir).await {
-                fail_task(&data, task_id, format!("Failed to create source dir: {}", e)).await;
+                fail_task(&data, task_id, format!("Failed to create source dir: {}", e), TaskStatus::UnknownError).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
@@ -143,7 +135,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             match unzip_result {
                 Ok(Ok(_)) => {},
                 _ => {
-                    fail_task(&data, task_id, "Failed to extract project".into()).await;
+                    fail_task(&data, task_id, "Failed to extract project".into(), TaskStatus::UnknownError).await;
                     stop_lease(&data, &task_id, &lease_handle).await;
                     continue;
                 }
@@ -161,7 +153,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             Err(e) => Some(e.to_string()),
         };
         if let Some(err_msg) = asset_err {
-            fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg)).await;
+            fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg), TaskStatus::UnknownError).await;
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
@@ -177,14 +169,14 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             ("linux", "aarch64") => tiecc_root.join("linux_arm64-v8a/tiec"),
             ("windows", "x86_64") => tiecc_root.join("win_x86_64/tiec.exe"),
             _ => {
-                fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch)).await;
+                fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch), TaskStatus::UnknownError).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
         };
 
         if !binary_path.exists() {
-            fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display())).await;
+            fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display()), TaskStatus::UnknownError).await;
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
@@ -222,7 +214,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         let mut child = match child_result {
             Ok(c) => c,
             Err(e) => {
-                fail_task(&data, task_id, format!("Failed to spawn builder: {}", e)).await;
+                fail_task(&data, task_id, format!("Failed to spawn builder: {}", e), TaskStatus::UnknownError).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
@@ -266,18 +258,18 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                         update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
                         log::info!("Task {} completed successfully", task_id);
                     } else {
-                         fail_task(&data, task_id, "Build command succeeded but APK file not found".into()).await;
+                         fail_task(&data, task_id, "Build command succeeded but APK file not found".into(), TaskStatus::CompilationFailed).await;
                     }
                 } else {
-                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status)).await;
+                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
                 }
             },
             Ok(Err(e)) => {
-                 fail_task(&data, task_id, format!("Wait error: {}", e)).await;
+                 fail_task(&data, task_id, format!("Wait error: {}", e), TaskStatus::UnknownError).await;
             },
             Err(_) => {
                 let _ = child.kill().await;
-                fail_task(&data, task_id, "Build timed out".into()).await;
+                fail_task(&data, task_id, "Build timed out".into(), TaskStatus::Timeout).await;
             }
         }
 
@@ -305,7 +297,7 @@ async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step
     }
 }
 
-async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String) {
+async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_status: TaskStatus) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
         if task.retry_count < task.max_retries {
             // Retry the task
@@ -315,7 +307,7 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String) {
 
             let backoff_secs = compute_retry_delay_seconds(task.retry_count);
             let next_run_at = Utc::now() + chrono::Duration::seconds(backoff_secs);
-            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
+                if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
                 log::error!("Failed to schedule retry in database: {}", e);
             }
 
@@ -324,21 +316,114 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String) {
                 log::error!("Failed to update retry state in database: {}", e);
             }
 
-            log::info!("Retrying task {} (attempt {}/{})", task_id, task.retry_count, task.max_retries);
+            log::info!(
+                "Retrying task {} (attempt {}/{}), next_run_at={} ({}s)",
+                task_id,
+                task.retry_count,
+                task.max_retries,
+                next_run_at.to_rfc3339(),
+                backoff_secs
+            );
+
+            let countdown_task_id = task_id;
+            let countdown_secs = backoff_secs.max(1) as u64;
+            let countdown_data = data.clone();
+            tokio::spawn(async move {
+                log::info!("倒计时开始：任务 {}，总计 {} 秒", countdown_task_id, countdown_secs);
+                let mut remaining = countdown_secs;
+                let step = if countdown_secs > 10 { 5 } else { 1 };
+                while remaining > 0 {
+                    log::info!("倒计时重试：任务 {} 剩余 {} 秒", countdown_task_id, remaining);
+                    if let Err(e) = countdown_data
+                        .database
+                        .insert_task_event(
+                            &countdown_task_id,
+                            "retry_countdown",
+                            Some(TaskStatus::Queued),
+                            Some(&format!("倒计时重试：剩余 {} 秒", remaining)),
+                            None,
+                        )
+                        .await
+                    {
+                        log::warn!("倒计时事件写入失败 {}: {}", countdown_task_id, e);
+                    }
+                    let sleep_for = std::cmp::min(step, remaining);
+                    tokio::time::sleep(std::time::Duration::from_secs(sleep_for)).await;
+                    remaining = remaining.saturating_sub(sleep_for);
+                }
+                log::info!("倒计时结束：任务 {}，等待重试调度", countdown_task_id);
+                if let Err(e) = countdown_data
+                    .database
+                    .insert_task_event(
+                        &countdown_task_id,
+                        "retry_countdown_done",
+                        Some(TaskStatus::Queued),
+                        Some("倒计时结束，等待重试调度"),
+                        None,
+                    )
+                    .await
+                {
+                    log::warn!("倒计时结束事件写入失败 {}: {}", countdown_task_id, e);
+                }
+            });
 
             // Re-queue the task with backoff
-            data.enforce_queue_capacity(data.queue_capacity).await;
-            update_task_status(
-                data,
-                &task_id,
-                TaskStatus::Queued,
-                0,
-                Some(format!("Retrying in {}s (attempt {}/{})", backoff_secs, task.retry_count, task.max_retries)),
-                task.error.clone(),
-            ).await;
+            // Skipped enforce_queue_capacity to avoid potential deadlock and prioritize retries
+            
+            // INLINED update_task_status LOGIC TO AVOID DEADLOCK
+            task.status = TaskStatus::Queued;
+            task.progress = 0;
+            task.current_step = Some(format!("Retrying in {}s (attempt {}/{})", backoff_secs, task.retry_count, task.max_retries));
+            task.updated_at = Utc::now();
+            
+            // Save to database
+            if let Err(e) = data.database.update_task(&task).await {
+                log::error!("Failed to update task in database: {}", e);
+            }
+            
+            // Write event
+            if let Err(e) = data.database.insert_task_event(&task_id, "status_change", Some(TaskStatus::Queued), task.error.as_deref(), None).await {
+                log::warn!("Failed to write task event for {}: {}", task_id, e);
+            }
+
+            // Clear lease
+            if let Err(e) = data.database.clear_lease(&task_id).await {
+                log::warn!("Failed to clear lease for task {}: {}", task_id, e);
+            }
+
         } else {
             // Max retries reached, mark as failed
-            update_task_status(data, &task_id, TaskStatus::Failed, task.progress, Some("Build failed".into()), Some(format!("Task failed after {} attempts. Last error: {}", task.max_retries, error))).await;
+            // INLINED update_task_status LOGIC TO AVOID DEADLOCK
+            let is_timeout = match final_status {
+                TaskStatus::Timeout => true,
+                _ => false
+            };
+            
+            task.status = final_status.clone();
+            
+            let failed_msg = if is_timeout { "Build failed (Timeout)" } else { "Build failed" };
+            task.current_step = Some(failed_msg.into());
+            task.error = Some(format!("Task failed after {} attempts. Last error: {}", task.max_retries, error));
+            task.updated_at = Utc::now();
+            
+            // Update stats
+            data.failed_tasks.fetch_add(1, Ordering::Relaxed);
+
+            // Save to database
+            if let Err(e) = data.database.update_task(&task).await {
+                log::error!("Failed to update task in database: {}", e);
+            }
+
+            // Write event
+            if let Err(e) = data.database.insert_task_event(&task_id, "status_change", Some(final_status), task.error.as_deref(), None).await {
+                log::warn!("Failed to write task event for {}: {}", task_id, e);
+            }
+
+            // Clear lease
+            if let Err(e) = data.database.clear_lease(&task_id).await {
+                log::warn!("Failed to clear lease for task {}: {}", task_id, e);
+            }
+
             log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
         }
     }
@@ -376,9 +461,11 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
         for task in tasks {
             let should_cleanup = match task.status {
                 crate::models::TaskStatus::Success => task.updated_at < completed_cutoff,
-                crate::models::TaskStatus::Failed => task.updated_at < failed_cutoff,
+                crate::models::TaskStatus::UnknownError => task.updated_at < failed_cutoff,
+                crate::models::TaskStatus::Timeout => task.updated_at < failed_cutoff,
+                crate::models::TaskStatus::CompilationFailed => task.updated_at < failed_cutoff,
                 crate::models::TaskStatus::Cancelled => task.updated_at < expired_cutoff,
-                crate::models::TaskStatus::Queued => task.created_at < expired_cutoff,
+                crate::models::TaskStatus::Queued => task.updated_at < expired_cutoff,
                 crate::models::TaskStatus::Processing => task.updated_at < timeout_cutoff,
             };
 

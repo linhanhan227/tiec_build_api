@@ -9,10 +9,14 @@ pub enum TaskStatus {
     Queued,
     #[serde(rename = "处理中")]
     Processing,
-    #[serde(rename = "成功")]
+    #[serde(rename = "编译成功")]
     Success,
-    #[serde(rename = "失败")]
-    Failed,
+    #[serde(rename = "未知错误")]
+    UnknownError,
+    #[serde(rename = "编译失败")]
+    CompilationFailed,
+    #[serde(rename = "编译超时")]
+    Timeout,
     #[serde(rename = "已取消")]
     Cancelled,
 }

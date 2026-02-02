@@ -7,6 +7,71 @@ use crate::error::ApiError;
 use crate::utils::{json_response, accepted_json_response, get_client_ip};
 use std::sync::atomic::Ordering;
 
+pub async fn create_build_task_for_user(
+    file_id_str: &str,
+    user_id: String,
+    data: web::Data<AppState>,
+) -> Result<(Uuid, TaskStatus), ApiError> {
+    if file_id_str.len() != 40 || !file_id_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest("Invalid File ID format".into()));
+    }
+
+    let extracted_dir = format!("{}/{}_extracted", data.upload_dir, file_id_str);
+    let tsp_path = format!("{}/{}.tsp", data.upload_dir, file_id_str);
+    let file_path = if std::path::Path::new(&extracted_dir).exists() {
+        extracted_dir
+    } else if std::path::Path::new(&tsp_path).exists() {
+        tsp_path
+    } else {
+        return Err(ApiError::NotFound("File not found or expired".into()));
+    };
+
+    if let Ok(Some(existing_task)) = data
+        .database
+        .find_latest_task_by_file_id_and_user_id(file_id_str, &user_id)
+        .await
+    {
+        match existing_task.status {
+            TaskStatus::UnknownError | TaskStatus::Cancelled | TaskStatus::Timeout | TaskStatus::CompilationFailed => {}
+            _ => {
+                return Ok((existing_task.task_id, existing_task.status));
+            }
+        }
+    }
+
+    let task_id = Uuid::new_v4();
+    let task = Task {
+        task_id,
+        status: TaskStatus::Queued,
+        progress: 0,
+        estimated_time_remaining: None,
+        current_step: Some("Queued".into()),
+        error: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        retry_count: 0,
+        max_retries: data.max_retries,
+        build_duration: None,
+        priority: 0,
+        file_id: file_id_str.to_string(),
+        file_path: file_path.clone(),
+        output_path: None,
+        user_id,
+    };
+
+    data.tasks.insert(task_id, task.clone());
+    data.total_tasks.fetch_add(1, Ordering::Relaxed);
+
+    if let Err(e) = data.save_task_to_db(&task).await {
+        log::error!("Failed to save task to database: {}", e);
+        return Err(ApiError::InternalServerError);
+    }
+
+    data.enqueue_task(task_id, data.queue_capacity).await;
+
+    Ok((task_id, TaskStatus::Queued))
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/build",
@@ -23,70 +88,12 @@ pub async fn create_build(
     build_req: web::Json<BuildRequest>,
     data: web::Data<AppState>,
 ) -> Result<impl Responder, ApiError> {
-    let file_id_str = &build_req.file_id;
-    if file_id_str.len() != 40 || !file_id_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ApiError::BadRequest("Invalid File ID format".into()));
-    }
-
     let user_id = get_client_ip(&req);
-
-    let extracted_dir = format!("{}/{}_extracted", data.upload_dir, file_id_str);
-    let tsp_path = format!("{}/{}.tsp", data.upload_dir, file_id_str);
-    let file_path = if std::path::Path::new(&extracted_dir).exists() {
-        extracted_dir
-    } else if std::path::Path::new(&tsp_path).exists() {
-        tsp_path
-    } else {
-        return Err(ApiError::NotFound("File not found or expired".into()));
-    };
-
-    if let Ok(Some(existing_task)) = data.database.find_latest_task_by_file_id_and_user_id(file_id_str, &user_id).await {
-        match existing_task.status {
-            TaskStatus::Failed | TaskStatus::Cancelled => {}
-            _ => {
-                return Ok(accepted_json_response(BuildResponse {
-                    task_id: existing_task.task_id.to_string(),
-                    status: existing_task.status,
-                }));
-            }
-        }
-    }
-
-    let task_id = Uuid::new_v4();
-    let task = Task {
-        task_id,
-        status: TaskStatus::Queued,
-        progress: 0,
-        estimated_time_remaining: None,
-        current_step: Some("Queued".into()),
-        error: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-        retry_count: 0,
-        max_retries: 3, // Allow up to 3 retries
-        build_duration: None,
-        priority: 0, // Default priority
-        file_id: file_id_str.to_string(),
-        file_path: file_path.clone(),
-        output_path: None,
-        user_id,
-    };
-
-    data.tasks.insert(task_id, task.clone());
-    data.total_tasks.fetch_add(1, Ordering::Relaxed);
-
-    // Save to database
-    if let Err(e) = data.save_task_to_db(&task).await {
-        log::error!("Failed to save task to database: {}", e);
-        return Err(ApiError::InternalServerError);
-    }
-    
-    // Enqueue task
-    data.enqueue_task(task_id, data.queue_capacity).await;
+    let (task_id, status) = create_build_task_for_user(&build_req.file_id, user_id, data).await?;
 
     Ok(accepted_json_response(BuildResponse {
         task_id: task_id.to_string(),
-        status: TaskStatus::Queued,
+        status,
     }))
 }
 

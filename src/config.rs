@@ -9,6 +9,7 @@ pub struct Config {
     pub cleanup_interval: u64,
     pub cleanup_retention_secs: u64,
     pub hourly_ip_limit: u32,
+    pub max_retries: u8,
 }
 
 impl Config {
@@ -42,6 +43,10 @@ impl Config {
                 .unwrap_or_else(|_| "20".into())
                 .parse()
                 .unwrap_or(20),
+            max_retries: std::env::var("MAX_RETRIES")
+                .unwrap_or_else(|_| "3".into())
+                .parse()
+                .unwrap_or(3),
         }
     }
 }

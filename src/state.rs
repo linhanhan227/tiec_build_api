@@ -25,10 +25,11 @@ pub struct AppState {
     // Worker senders for load balancing
     #[allow(dead_code)]
     pub worker_senders: Vec<TaskSender>,
+    pub max_retries: u8,
 }
 
 impl AppState {
-    pub fn new(upload_dir: String, tiecc_dir: String, stdlib_dir: String, queue_capacity: usize, database: Database) -> Self {
+    pub fn new(upload_dir: String, tiecc_dir: String, stdlib_dir: String, queue_capacity: usize, database: Database, max_retries: u8) -> Self {
         AppState {
             tasks: dashmap::DashMap::new(),
             upload_dir,
@@ -36,6 +37,7 @@ impl AppState {
             stdlib_dir,
             queue_capacity,
             database,
+            max_retries,
             total_tasks: AtomicU64::new(0),
             completed_tasks: AtomicU64::new(0),
             failed_tasks: AtomicU64::new(0),

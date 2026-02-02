@@ -263,10 +263,12 @@ impl Database {
                 status: match row.get::<_, String>(1)?.as_str() {
                     "排队中" => TaskStatus::Queued,
                     "处理中" => TaskStatus::Processing,
-                    "成功" => TaskStatus::Success,
-                    "失败" => TaskStatus::Failed,
+                    "成功" | "编译成功" => TaskStatus::Success,
+                    "失败" | "未知错误" => TaskStatus::UnknownError,
+                    "编译失败" => TaskStatus::CompilationFailed,
+                    "超时" | "编译超时" => TaskStatus::Timeout,
                     "已取消" => TaskStatus::Cancelled,
-                    _ => TaskStatus::Failed,
+                    _ => TaskStatus::UnknownError,
                 },
                 progress: row.get(2)?,
                 estimated_time_remaining: row.get::<_, Option<String>>(3)?
@@ -558,10 +560,12 @@ impl Database {
                 status: match row.get::<_, String>(1)?.as_str() {
                     "排队中" => TaskStatus::Queued,
                     "处理中" => TaskStatus::Processing,
-                    "成功" => TaskStatus::Success,
-                    "失败" => TaskStatus::Failed,
+                    "成功" | "编译成功" => TaskStatus::Success,
+                    "失败" | "未知错误" => TaskStatus::UnknownError,
+                    "编译失败" => TaskStatus::CompilationFailed,
+                    "超时" | "编译超时" => TaskStatus::Timeout,
                     "已取消" => TaskStatus::Cancelled,
-                    _ => TaskStatus::Failed,
+                    _ => TaskStatus::UnknownError,
                 },
                 progress: row.get(2)?,
                 estimated_time_remaining: row.get::<_, Option<String>>(3)?
@@ -608,10 +612,12 @@ impl Database {
                 let status = status_str.as_deref().map(|s| match s {
                     "排队中" => TaskStatus::Queued,
                     "处理中" => TaskStatus::Processing,
-                    "成功" => TaskStatus::Success,
-                    "失败" => TaskStatus::Failed,
+                    "成功" | "编译成功" => TaskStatus::Success,
+                    "失败" | "未知错误" => TaskStatus::UnknownError,
+                    "编译失败" => TaskStatus::CompilationFailed,
+                    "超时" | "编译超时" => TaskStatus::Timeout,
                     "已取消" => TaskStatus::Cancelled,
-                    _ => TaskStatus::Failed,
+                    _ => TaskStatus::UnknownError,
                 });
 
                 Ok(TaskEvent {
@@ -651,10 +657,12 @@ impl Database {
                 status: match row.get::<_, String>(1)?.as_str() {
                     "排队中" => TaskStatus::Queued,
                     "处理中" => TaskStatus::Processing,
-                    "成功" => TaskStatus::Success,
-                    "失败" => TaskStatus::Failed,
+                    "成功" | "编译成功" => TaskStatus::Success,
+                    "失败" | "未知错误" => TaskStatus::UnknownError,
+                    "编译失败" => TaskStatus::CompilationFailed,
+                    "超时" | "编译超时" => TaskStatus::Timeout,
                     "已取消" => TaskStatus::Cancelled,
-                    _ => TaskStatus::Failed,
+                    _ => TaskStatus::UnknownError,
                 },
                 progress: row.get(2)?,
                 estimated_time_remaining: row.get::<_, Option<String>>(3)?
@@ -700,10 +708,12 @@ impl Database {
                 status: match row.get::<_, String>(1)?.as_str() {
                     "排队中" => TaskStatus::Queued,
                     "处理中" => TaskStatus::Processing,
-                    "成功" => TaskStatus::Success,
-                    "失败" => TaskStatus::Failed,
+                    "成功" | "编译成功" => TaskStatus::Success,
+                    "失败" | "未知错误" => TaskStatus::UnknownError,
+                    "编译失败" => TaskStatus::CompilationFailed,
+                    "超时" | "编译超时" => TaskStatus::Timeout,
                     "已取消" => TaskStatus::Cancelled,
-                    _ => TaskStatus::Failed,
+                    _ => TaskStatus::UnknownError,
                 },
                 progress: row.get(2)?,
                 estimated_time_remaining: row.get::<_, Option<String>>(3)?
@@ -749,8 +759,12 @@ impl Database {
         )?;
 
         let failed: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status = ?",
-            [serde_json::to_string(&TaskStatus::Failed).unwrap()],
+            "SELECT COUNT(*) FROM tasks WHERE status IN (?, ?, ?)",
+            rusqlite::params![
+                serde_json::to_string(&TaskStatus::UnknownError).unwrap(),
+                serde_json::to_string(&TaskStatus::CompilationFailed).unwrap(),
+                serde_json::to_string(&TaskStatus::Timeout).unwrap()
+            ],
             |row| row.get(0),
         )?;
 

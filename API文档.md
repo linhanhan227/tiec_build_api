@@ -499,3 +499,40 @@ curl http://localhost:8080/api-docs/openapi.json
 | TASK_TIMEOUT | 900 | 单任务超时（秒） |
 | CLEANUP_INTERVAL | 3600 | 清理任务间隔（秒） |
 | HOURLY_IP_LIMIT | 20 | 每 IP 每小时限制（仅限部分 API） |
+
+### build-test 测试参数（可选）
+
+build-test 通过 **真实 API 流程**（/api/v1/upload、/api/v1/build）测试队列功能。优先使用 `test.json` 配置：
+
+**test.json 示例：**
+
+```json
+{
+	"base_url": "http://127.0.0.1:8080",
+	"file_path": "./demo.tsp",
+	"file_paths": ["./demo1.tsp", "./demo2.tsp"],
+	"interval_ms": 200,
+	"task_timeout": 900,
+	"queue_capacity": 30,
+	"cleanup_interval": 30,
+	"cleanup_retention_secs": 15,
+	"hourly_ip_limit": 60
+}
+```
+
+**说明：**
+- `file_path` 与 `file_paths` 可同时存在
+- build-test 会先上传文件获得 file_id，再调用 /api/v1/build 创建真实构建任务
+ - 任务重试倒计时会持续写入任务事件接口（event_type：`retry_countdown` / `retry_countdown_done`）
+
+**环境变量（可选，覆盖或补充 test.json）：**
+
+| 变量名 | 默认值 | 说明 |
+| --- | --- | --- |
+| BUILD_TEST_CONFIG | test.json | 配置文件路径 |
+| BUILD_TEST_BASE_URL | http://127.0.0.1:8080 | 测试请求目标地址 |
+| BUILD_TEST_FILE_PATH | 无 | 单个 .tsp 文件路径 |
+| BUILD_TEST_FILE_PATHS | 无 | 多个 .tsp 文件路径（逗号分隔） |
+| BUILD_TEST_INTERVAL_MS | 200 | 每个构建请求间隔（毫秒） |
+| BUILD_TEST_TASK_TIMEOUT | 无 | build-test 模式下临时覆盖 TASK_TIMEOUT |
+| BUILD_TEST_QUEUE_CAPACITY | 无 | build-test 模式下临时覆盖 QUEUE_CAPACITY |
