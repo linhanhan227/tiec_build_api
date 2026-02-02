@@ -25,6 +25,8 @@ use std::net::IpAddr;
 use std::net::IpAddr;
 use uuid::Uuid;
 use tokio::sync::Mutex;
+use chrono::Utc;
+use crate::models::{Task, TaskStatus};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -86,7 +88,12 @@ fn get_local_ips() -> Vec<String> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "error");
+    let build_test = std::env::args().any(|arg| arg == "--build-test" || arg == "build-test" || arg == "--build-tset" || arg == "build-tset");
+    if build_test {
+        std::env::set_var("RUST_LOG", "info");
+    } else {
+        std::env::set_var("RUST_LOG", "error");
+    }
     env_logger::init();
 
     let config = Config::from_env();
@@ -141,6 +148,45 @@ async fn main() -> std::io::Result<()> {
 
     // Load existing tasks from database
     state.load_tasks_from_db().await.expect("Failed to load tasks from database");
+
+    if build_test {
+        log::info!("build-test enabled: inserting test task into real queue");
+
+        let test_task_id = Uuid::new_v4();
+        let test_file_id = format!("build-test-{}", test_task_id);
+        let test_task = Task {
+            task_id: test_task_id,
+            status: TaskStatus::Queued,
+            progress: 0,
+            estimated_time_remaining: None,
+            current_step: Some("Queued (build-test)".into()),
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            retry_count: 0,
+            max_retries: 0,
+            build_duration: None,
+            priority: 1,
+            file_id: test_file_id,
+            file_path: upload_dir.clone(),
+            output_path: None,
+            user_id: "build-test".into(),
+        };
+
+        state.tasks.insert(test_task_id, test_task.clone());
+        state.total_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if let Err(e) = state.save_task_to_db(&test_task).await {
+            log::error!("build-test: failed to save test task to database: {}", e);
+        } else {
+            state.enqueue_task(test_task_id, state.queue_capacity).await;
+            if let Ok(count) = state.database.count_queued_tasks().await {
+                log::info!("build-test: test task enqueued, queued_count={}", count);
+            } else {
+                log::info!("build-test: test task enqueued (queued_count unavailable)");
+            }
+        }
+    }
 
     // Start multiple workers
     for i in 0..config.worker_count {

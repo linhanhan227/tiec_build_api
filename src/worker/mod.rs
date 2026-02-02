@@ -95,12 +95,21 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         update_task_status(&data, &task_id, TaskStatus::Processing, 5, Some("Initializing environment".into()), None).await;
 
         // 2. Prepare paths
-        let (file_path, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
-            (task.file_path.clone(), task.user_id.clone())
+        let (file_path, file_id, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
+            (task.file_path.clone(), task.file_id.clone(), task.user_id.clone())
         } else {
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         };
+
+        if file_id.starts_with("build-test-") {
+            log::info!("build-test task detected (leased from real queue): {}", task_id);
+            update_progress(&data, task_id, 50, "build-test queue verification in progress...").await;
+            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("build-test queue verification success".into()), None).await;
+            log::info!("build-test task completed: {}", task_id);
+            stop_lease(&data, &task_id, &lease_handle).await;
+            continue;
+        }
 
         let mut project_dir = file_path.clone();
 
