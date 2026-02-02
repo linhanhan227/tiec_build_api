@@ -7,6 +7,7 @@ pub struct Config {
     pub worker_count: usize,
     pub task_timeout: u64,
     pub cleanup_interval: u64,
+    pub cleanup_retention_secs: u64,
     pub hourly_ip_limit: u32,
 }
 
@@ -30,6 +31,10 @@ impl Config {
                 .parse()
                 .unwrap_or(900),
             cleanup_interval: std::env::var("CLEANUP_INTERVAL")
+                .unwrap_or_else(|_| "3600".into())
+                .parse()
+                .unwrap_or(3600),
+            cleanup_retention_secs: std::env::var("CLEANUP_RETENTION_SECS")
                 .unwrap_or_else(|_| "3600".into())
                 .parse()
                 .unwrap_or(3600),

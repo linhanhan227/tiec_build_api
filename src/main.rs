@@ -91,12 +91,21 @@ async fn main() -> std::io::Result<()> {
     let build_test = std::env::args().any(|arg| arg == "--build-test" || arg == "build-test" || arg == "--build-tset" || arg == "build-tset");
     if build_test {
         std::env::set_var("RUST_LOG", "info");
+        std::env::set_var("TASK_TIMEOUT", "20");
+        std::env::set_var("CLEANUP_INTERVAL", "30");
+        std::env::set_var("CLEANUP_RETENTION_SECS", "15");
     } else {
         std::env::set_var("RUST_LOG", "error");
     }
     env_logger::init();
 
     let config = Config::from_env();
+
+    if build_test {
+        std::env::remove_var("TASK_TIMEOUT");
+        std::env::remove_var("CLEANUP_INTERVAL");
+        std::env::remove_var("CLEANUP_RETENTION_SECS");
+    }
 
     // Set paths for embedded resources (extracted on first use)测试构建上传
     let exe_dir = std::env::current_exe()
@@ -150,41 +159,44 @@ async fn main() -> std::io::Result<()> {
     state.load_tasks_from_db().await.expect("Failed to load tasks from database");
 
     if build_test {
-        log::info!("build-test enabled: inserting test task into real queue");
+        log::info!("build-test 已启用：正在向真实队列插入 20 个测试任务");
 
-        let test_task_id = Uuid::new_v4();
-        let test_file_id = format!("build-test-{}", test_task_id);
-        let test_task = Task {
-            task_id: test_task_id,
-            status: TaskStatus::Queued,
-            progress: 0,
-            estimated_time_remaining: None,
-            current_step: Some("Queued (build-test)".into()),
-            error: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            retry_count: 0,
-            max_retries: 0,
-            build_duration: None,
-            priority: 1,
-            file_id: test_file_id,
-            file_path: upload_dir.clone(),
-            output_path: None,
-            user_id: "build-test".into(),
-        };
+        for idx in 0..20 {
+            let test_task_id = Uuid::new_v4();
+            let test_file_id = format!("build-test-{}", test_task_id);
+            let test_task = Task {
+                task_id: test_task_id,
+                status: TaskStatus::Queued,
+                progress: 0,
+                estimated_time_remaining: None,
+                current_step: Some(format!("已入队（build-test 第 {} 个）", idx + 1)),
+                error: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                retry_count: 0,
+                max_retries: 0,
+                build_duration: None,
+                priority: 1,
+                file_id: test_file_id,
+                file_path: upload_dir.clone(),
+                output_path: None,
+                user_id: "build-test".into(),
+            };
 
-        state.tasks.insert(test_task_id, test_task.clone());
-        state.total_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state.tasks.insert(test_task_id, test_task.clone());
+            state.total_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if let Err(e) = state.save_task_to_db(&test_task).await {
-            log::error!("build-test: failed to save test task to database: {}", e);
-        } else {
-            state.enqueue_task(test_task_id, state.queue_capacity).await;
-            if let Ok(count) = state.database.count_queued_tasks().await {
-                log::info!("build-test: test task enqueued, queued_count={}", count);
-            } else {
-                log::info!("build-test: test task enqueued (queued_count unavailable)");
+            if let Err(e) = state.save_task_to_db(&test_task).await {
+                log::error!("build-test：保存测试任务失败 {}: {}", test_task_id, e);
+                continue;
             }
+
+            state.enqueue_task(test_task_id, state.queue_capacity).await;
+            log::info!("build-test：已入队测试任务 {}（{}/20）", test_task_id, idx + 1);
+        }
+
+        if let Ok(count) = state.database.count_queued_tasks().await {
+            log::info!("build-test：插入后队列数量={}", count);
         }
     }
 
@@ -201,9 +213,10 @@ async fn main() -> std::io::Result<()> {
     // Start cleanup task
     let cleanup_state = state.clone();
     let cleanup_interval = config.cleanup_interval;
+    let cleanup_retention_secs = config.cleanup_retention_secs;
     let task_timeout = config.task_timeout;
     tokio::spawn(async move {
-        worker::cleanup_task(cleanup_state.into_inner(), cleanup_interval, task_timeout).await;
+        worker::cleanup_task(cleanup_state.into_inner(), cleanup_interval, task_timeout, cleanup_retention_secs).await;
     });
 
     let local_ips = get_local_ips();

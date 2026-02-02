@@ -103,10 +103,10 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         };
 
         if file_id.starts_with("build-test-") {
-            log::info!("build-test task detected (leased from real queue): {}", task_id);
-            update_progress(&data, task_id, 50, "build-test queue verification in progress...").await;
-            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("build-test queue verification success".into()), None).await;
-            log::info!("build-test task completed: {}", task_id);
+            log::info!("build-test 任务已被真实队列租约：{}", task_id);
+            update_progress(&data, task_id, 50, "build-test 队列验证进行中...").await;
+            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("build-test 队列验证成功".into()), None).await;
+            log::info!("build-test 任务完成：{}", task_id);
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
@@ -352,16 +352,16 @@ fn compute_retry_delay_seconds(retry_count: u8) -> i64 {
     (base.saturating_mul(exp)).min(max_delay) + jitter
 }
 
-pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeout: u64) {
+pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeout: u64, retention_secs: u64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
     loop {
         interval.tick().await;
-        log::info!("Running cleanup task");
+        log::info!("正在运行清理任务（保留窗口 {} 秒）", retention_secs);
 
         let now = chrono::Utc::now();
-        let completed_cutoff = now - chrono::Duration::hours(1);
-        let failed_cutoff = now - chrono::Duration::hours(1);
-        let expired_cutoff = now - chrono::Duration::hours(1);
+        let completed_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
+        let failed_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
+        let expired_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
         let timeout_cutoff = now - chrono::Duration::seconds(task_timeout as i64);
 
         let tasks = match data.database.get_all_tasks().await {
@@ -395,7 +395,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
             }
 
             cleaned += 1;
-            log::info!("Cleaned expired/timeout task: {}", task.task_id);
+            log::info!("已清理过期/超时任务：{}", task.task_id);
         }
 
         if cleaned > 0 {
