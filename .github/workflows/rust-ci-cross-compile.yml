@@ -267,7 +267,7 @@ jobs:
       - name: Generate Nightly Tag
         id: nightly_tag
         run: |
-          echo "tag=全平台架构构建-$(date -u +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
+          echo "release_name=全平台架构构建-$(date -u +'%Y%m%d%H%M')" >> $GITHUB_OUTPUT
 
       - name: Download Artifacts
         uses: actions/download-artifact@v4
@@ -278,8 +278,8 @@ jobs:
       - name: Upload Nightly Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.nightly_tag.outputs.tag }}
-          name: ${{ steps.nightly_tag.outputs.tag }}
+          tag_name: latest
+          name: ${{ steps.nightly_tag.outputs.release_name }}
           prerelease: true
           files: dist/**
         env:
