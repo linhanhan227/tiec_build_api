@@ -280,7 +280,7 @@ jobs:
         with:
           tag_name: latest
           name: ${{ steps.nightly_tag.outputs.release_name }}
-          prerelease: true
+          prerelease: false
           files: dist/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
