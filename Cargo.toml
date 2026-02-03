@@ -38,7 +38,7 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 actix-governor = "0.5"
 rand = "0.8"
 sha1 = "0.10"
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 
 [target.'cfg(not(windows))'.dependencies]
 get_if_addrs = "0.5"
