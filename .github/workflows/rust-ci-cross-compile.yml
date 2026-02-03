@@ -278,7 +278,7 @@ jobs:
       - name: Upload Nightly Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
+          tag_name: 
           name: ${{ steps.nightly_tag.outputs.release_name }}
           prerelease: false
           make_latest: true
