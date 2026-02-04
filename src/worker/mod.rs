@@ -9,7 +9,7 @@ use tokio::fs;
 use uuid::Uuid;
 use chrono::Utc;
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 async fn update_task_status(data: &Arc<AppState>, task_id: &Uuid, status: TaskStatus, progress: u8, current_step: Option<String>, error: Option<String>) {
     if let Some(mut task) = data.tasks.get_mut(task_id) {
@@ -113,7 +113,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             let unzip_dir = format!("{}/{}_extracted", data.upload_dir, file_stem);
 
             if let Err(e) = fs::create_dir_all(&unzip_dir).await {
-                fail_task(&data, task_id, format!("Failed to create source dir: {}", e), TaskStatus::UnknownError).await;
+                fail_task(&data, task_id, format!("Failed to create source dir: {}", e), TaskStatus::CompilationFailed).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
@@ -135,7 +135,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             match unzip_result {
                 Ok(Ok(_)) => {},
                 _ => {
-                    fail_task(&data, task_id, "Failed to extract project".into(), TaskStatus::UnknownError).await;
+                    fail_task(&data, task_id, "Failed to extract project".into(), TaskStatus::CompilationFailed).await;
                     stop_lease(&data, &task_id, &lease_handle).await;
                     continue;
                 }
@@ -153,7 +153,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             Err(e) => Some(e.to_string()),
         };
         if let Some(err_msg) = asset_err {
-            fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg), TaskStatus::UnknownError).await;
+            fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg), TaskStatus::CompilationFailed).await;
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
@@ -169,14 +169,14 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             ("linux", "aarch64") => tiecc_root.join("linux_arm64-v8a/tiec"),
             ("windows", "x86_64") => tiecc_root.join("win_x86_64/tiec.exe"),
             _ => {
-                fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch), TaskStatus::UnknownError).await;
+                fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch), TaskStatus::CompilationFailed).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
         };
 
         if !binary_path.exists() {
-            fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display()), TaskStatus::UnknownError).await;
+            fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display()), TaskStatus::CompilationFailed).await;
             stop_lease(&data, &task_id, &lease_handle).await;
             continue;
         }
@@ -214,7 +214,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         let mut child = match child_result {
             Ok(c) => c,
             Err(e) => {
-                fail_task(&data, task_id, format!("Failed to spawn builder: {}", e), TaskStatus::UnknownError).await;
+                fail_task(&data, task_id, format!("Failed to spawn builder: {}", e), TaskStatus::CompilationFailed).await;
                 stop_lease(&data, &task_id, &lease_handle).await;
                 continue;
             }
@@ -227,6 +227,9 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
 
+        let error_seen = Arc::new(AtomicBool::new(false));
+        let last_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
+
         // 5. Monitor execution
         // We need to concurrently read logs and wait for exit
         let _data_clone = data.clone();
@@ -238,16 +241,30 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
             }
         });
         
+        let err_flag = error_seen.clone();
+        let err_msg = last_error.clone();
         let _err_task = tokio::spawn(async move {
-             while let Ok(Some(line)) = stderr_reader.next_line().await {
-               log::error!("[Task {} Stderr]: {}", task_id, line);
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                log::error!("[Task {} Stderr]: {}", task_id, line);
+                if line.contains("ERROR") || line.contains("错误") {
+                    err_flag.store(true, Ordering::Relaxed);
+                    let mut guard = err_msg.lock().await;
+                    *guard = Some(line.clone());
+                }
             }
         });
 
         // Use timeout
         match tokio::time::timeout(std::time::Duration::from_secs(task_timeout), child.wait()).await {
             Ok(Ok(status)) => {
-                if status.success() {
+                if error_seen.load(Ordering::Relaxed) {
+                    let err_msg = last_error
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| "Compiler error log detected".to_string());
+                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
+                } else if status.success() {
                     // Find APK file in build directory
                     let apk_path = find_apk_file(&build_output_dir).await;
                     if let Some(apk_file) = apk_path {
@@ -258,29 +275,41 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                         update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
                         log::info!("Task {} completed successfully", task_id);
                     } else {
-                         fail_task(&data, task_id, "Build command succeeded but APK file not found".into(), TaskStatus::CompilationFailed).await;
+                        fail_task(&data, task_id, "Build command succeeded but APK file not found".into(), TaskStatus::CompilationFailed).await;
                     }
                 } else {
-                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
+                    fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
                 }
             },
             Ok(Err(e)) => {
-                 fail_task(&data, task_id, format!("Wait error: {}", e), TaskStatus::UnknownError).await;
+                if error_seen.load(Ordering::Relaxed) {
+                    let err_msg = last_error
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| "Compiler error log detected".to_string());
+                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
+                } else {
+                    fail_task(&data, task_id, format!("Wait error: {}", e), TaskStatus::UnknownError).await;
+                }
             },
             Err(_) => {
                 let _ = child.kill().await;
-                fail_task(&data, task_id, "Build timed out".into(), TaskStatus::Timeout).await;
+                if error_seen.load(Ordering::Relaxed) {
+                    let err_msg = last_error
+                        .lock()
+                        .await
+                        .clone()
+                        .unwrap_or_else(|| "Compiler error log detected".to_string());
+                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
+                } else {
+                    fail_task(&data, task_id, "Build timed out".into(), TaskStatus::Timeout).await;
+                }
             }
         }
 
         stop_lease(&data, &task_id, &lease_handle).await;
         
-        // Clean up uploads/work dir if needed (user requirement 1 mentioned cleanup task, 
-        // but here we might want to keep output? "output_dir" should persist for download)
-        // Cleanup source and file_path can be done here or by cron.
-        
-        // Check "retention" policy.
-        // For now, keep the APK.
     }
 }
 
@@ -300,9 +329,10 @@ async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step
 async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_status: TaskStatus) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
         // Retry logic:
-        // - Only retry if status is NOT CompilationFailed (user request: compile fail -> mark fail directly)
-        // - Only retry if retry_count < max_retries
-        let should_retry = final_status != TaskStatus::CompilationFailed && task.retry_count < task.max_retries;
+        // - Only retry if status is Timeout (transient error).
+        // - All other errors (CompilationFailed, UnknownError) are treated as fatal and not retryable.
+        let is_timeout = matches!(final_status, TaskStatus::Timeout);
+        let should_retry = is_timeout && task.retry_count < task.max_retries;
 
         if should_retry {
             // Increment retry count
@@ -315,8 +345,15 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
             
             // Update in-memory state
             task.status = TaskStatus::Queued;
-            task.progress = 0;
+            task.progress = 0; // Reset progress
             task.current_step = Some(format!("Waiting for retry (backoff {}s)", backoff_secs));
+            
+            // Don't overwrite `error` with retry message if we want to see the original error in logs? 
+            // Better to prepend/append. But `error` field in Task is usually "last error".
+            // However, user said "already reported error but still retries". 
+            // They might mean the API response shows "Error: ..." but status is something else?
+            // If status is Queued, the user sees "Queued" but with an error message?
+            // Let's explicitly set error to indicate it's a transient failure.
             task.error = Some(retry_msg.clone());
             task.updated_at = Utc::now();
             
@@ -329,6 +366,11 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
             }
             
             // Also update the task definition in DB to persist retry_count and such
+            // IMPORTANT: We need to make sure we don't overwrite the schedule_retry updates (status/next_run_at)
+            // update_task updates status too. It uses `task.status` which we set to Queued above.
+            // update_task DOES NOT update `next_run_at`.
+            // So calling update_task AFTER schedule_retry is fine, provided `next_run_at` is not touched by update_task.
+            // `update_task` implementation: updates status, progress, ..., retry_count. Correct.
             if let Err(e) = data.database.update_task(&task).await {
                 log::error!("Failed to update task retry state for {}: {}", task_id, e);
             }
@@ -364,10 +406,9 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                 log::warn!("Failed to clear lease for task {}: {}", task_id, e);
             }
 
-            // Cleanup related files immediately for failed tasks (keep record for API query)
+            // Cleanup related files immediately for failed tasks (keep record for query)
             let file_path = task.file_path.clone();
             let upload_dir = data.upload_dir.clone();
-            let _db = data.database.clone();
             let task_id_clone = task_id;
             
             tokio::spawn(async move {
@@ -398,6 +439,7 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                          }
                     }
                 }
+
             });
         }
     }

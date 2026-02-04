@@ -117,7 +117,21 @@ pub async fn get_build_status(
     let task_id_str = task_id_path.into_inner();
     let task_id = Uuid::parse_str(&task_id_str).map_err(|_| ApiError::BadRequest("Invalid Task ID".into()))?;
     if let Some(task) = data.tasks.get(&task_id) {
-        Ok(json_response(task.clone()))
+        let task_clone = task.clone();
+        let should_cleanup = matches!(
+            task.status,
+            TaskStatus::CompilationFailed | TaskStatus::UnknownError | TaskStatus::Timeout | TaskStatus::Cancelled
+        );
+        if should_cleanup {
+            let data_clone = data.clone();
+            tokio::spawn(async move {
+                data_clone.tasks.remove(&task_id);
+                if let Err(e) = data_clone.database.delete_task(&task_id).await {
+                    log::warn!("Failed to delete task record {}: {}", task_id, e);
+                }
+            });
+        }
+        Ok(json_response(task_clone))
     } else {
         Err(ApiError::NotFound("Task not found".into()))
     }
@@ -146,9 +160,10 @@ pub async fn get_build_events(
     let task_id_str = task_id_path.into_inner();
     let task_id = Uuid::parse_str(&task_id_str).map_err(|_| ApiError::BadRequest("Invalid Task ID".into()))?;
 
-    if data.tasks.get(&task_id).is_none() {
-        return Err(ApiError::NotFound("Task not found".into()));
-    }
+    let task = match data.tasks.get(&task_id) {
+        Some(t) => t,
+        None => return Err(ApiError::NotFound("Task not found".into())),
+    };
 
     let limit = query
         .get("limit")
@@ -162,6 +177,20 @@ pub async fn get_build_events(
 
     let events = data.database.get_task_events(&task_id, limit, offset).await
         .map_err(|_| ApiError::InternalServerError)?;
+
+    let should_cleanup = matches!(
+        task.status,
+        TaskStatus::CompilationFailed | TaskStatus::UnknownError | TaskStatus::Timeout | TaskStatus::Cancelled
+    );
+    if should_cleanup {
+        let data_clone = data.clone();
+        tokio::spawn(async move {
+            data_clone.tasks.remove(&task_id);
+            if let Err(e) = data_clone.database.delete_task(&task_id).await {
+                log::warn!("Failed to delete task record {}: {}", task_id, e);
+            }
+        });
+    }
 
     Ok(json_response(events))
 }
