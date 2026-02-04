@@ -274,18 +274,18 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                         .unwrap_or_else(|| "Compiler error log detected".to_string());
                     fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
                 } else if status.success() || success_seen.load(Ordering::Relaxed) {
-                    // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
-                    let apk_path = find_apk_file(&build_output_dir).await;
-                    if let Some(apk_file) = apk_path {
-                        update_progress(&data, task_id, 100, "Build successful").await;
-                        if let Some(mut task) = data.tasks.get_mut(&task_id) {
-                            task.output_path = Some(apk_file);
-                        }
-                        update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
-                        log::info!("Task {} completed successfully", task_id);
-                    } else {
-                        fail_task(&data, task_id, "Build command succeeded but APK file not found".into(), TaskStatus::CompilationFailed).await;
-                    }
+                    // 编译成功：仅做“编译”能力，不再尝试查找/产出 APK 等打包产物
+                    update_progress(&data, task_id, 100, "Compile successful").await;
+                    update_task_status(
+                        &data,
+                        &task_id,
+                        TaskStatus::Success,
+                        100,
+                        Some("Compile successful".into()),
+                        None,
+                    )
+                    .await;
+                    log::info!("Task {} completed successfully", task_id);
                 } else {
                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
                 }
