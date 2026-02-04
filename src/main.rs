@@ -304,52 +304,57 @@ fn get_local_ips() -> Vec<String> {
     ips
 }
 
+fn configure_build_test_environment(config: &Option<BuildTestConfig>) {
+    std::env::set_var("RUST_LOG", "info");
+
+    if let Some(cfg) = config {
+        if let Some(value) = cfg.task_timeout {
+            std::env::set_var("TASK_TIMEOUT", value.to_string());
+        }
+        if let Some(value) = cfg.queue_capacity {
+            std::env::set_var("QUEUE_CAPACITY", value.to_string());
+        }
+        if let Some(value) = cfg.cleanup_interval {
+            std::env::set_var("CLEANUP_INTERVAL", value.to_string());
+        }
+        if let Some(value) = cfg.cleanup_retention_secs {
+            std::env::set_var("CLEANUP_RETENTION_SECS", value.to_string());
+        }
+        if let Some(value) = cfg.hourly_ip_limit {
+            std::env::set_var("HOURLY_IP_LIMIT", value.to_string());
+        }
+        if let Some(value) = cfg.max_retries {
+            std::env::set_var("MAX_RETRIES", value.to_string());
+        }
+    }
+
+    if let Ok(v) = std::env::var("BUILD_TEST_TASK_TIMEOUT") {
+        std::env::set_var("TASK_TIMEOUT", v);
+    }
+    if let Ok(v) = std::env::var("BUILD_TEST_QUEUE_CAPACITY") {
+        std::env::set_var("QUEUE_CAPACITY", v);
+    }
+    
+    // Set defaults if not provided in config
+    if config.as_ref().and_then(|cfg| cfg.cleanup_interval).is_none() {
+        std::env::set_var("CLEANUP_INTERVAL", "30");
+    }
+    if config.as_ref().and_then(|cfg| cfg.cleanup_retention_secs).is_none() {
+        std::env::set_var("CLEANUP_RETENTION_SECS", "15");
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let build_test = std::env::args().any(|arg| arg == "--build-test" || arg == "build-test" || arg == "--build-tset" || arg == "build-tset");
+    let build_test = std::env::args().any(|arg| arg == "--build-test" || arg == "build-test");
     let build_test_config = if build_test {
         load_build_test_config()
     } else {
         None
     };
+
     if build_test {
-        std::env::set_var("RUST_LOG", "info");
-        if let Some(cfg) = &build_test_config {
-            if let Some(value) = cfg.task_timeout {
-                std::env::set_var("TASK_TIMEOUT", value.to_string());
-            }
-            if let Some(value) = cfg.queue_capacity {
-                std::env::set_var("QUEUE_CAPACITY", value.to_string());
-            }
-            if let Some(value) = cfg.cleanup_interval {
-                std::env::set_var("CLEANUP_INTERVAL", value.to_string());
-            }
-            if let Some(value) = cfg.cleanup_retention_secs {
-                std::env::set_var("CLEANUP_RETENTION_SECS", value.to_string());
-            }
-            if let Some(value) = cfg.hourly_ip_limit {
-                std::env::set_var("HOURLY_IP_LIMIT", value.to_string());
-            }
-            if let Some(value) = cfg.max_retries {
-                std::env::set_var("MAX_RETRIES", value.to_string());
-            }
-        }
-        if std::env::var("BUILD_TEST_TASK_TIMEOUT").is_ok() {
-            if let Ok(v) = std::env::var("BUILD_TEST_TASK_TIMEOUT") {
-                std::env::set_var("TASK_TIMEOUT", v);
-            }
-        }
-        if std::env::var("BUILD_TEST_QUEUE_CAPACITY").is_ok() {
-            if let Ok(v) = std::env::var("BUILD_TEST_QUEUE_CAPACITY") {
-                std::env::set_var("QUEUE_CAPACITY", v);
-            }
-        }
-        if build_test_config.as_ref().and_then(|cfg| cfg.cleanup_interval).is_none() {
-            std::env::set_var("CLEANUP_INTERVAL", "30");
-        }
-        if build_test_config.as_ref().and_then(|cfg| cfg.cleanup_retention_secs).is_none() {
-            std::env::set_var("CLEANUP_RETENTION_SECS", "15");
-        }
+        configure_build_test_environment(&build_test_config);
     } else {
         std::env::set_var("RUST_LOG", "error");
     }
@@ -358,6 +363,7 @@ async fn main() -> std::io::Result<()> {
     let config = Config::from_env();
 
     if build_test {
+        // Remove variables that might conflict or were temporary
         std::env::remove_var("TASK_TIMEOUT");
         std::env::remove_var("QUEUE_CAPACITY");
         std::env::remove_var("CLEANUP_INTERVAL");
@@ -406,7 +412,7 @@ async fn main() -> std::io::Result<()> {
     ));
     
     // Ensure assets are extracted on startup
-    if let Err(e) = state.ensure_assets_extracted() {
+    if let Err(e) = state.ensure_assets_extracted(build_test) {
         log::error!("Failed to extract assets: {}", e);
         // We might want to panic here if assets are critical
         panic!("Failed to extract assets: {}", e);

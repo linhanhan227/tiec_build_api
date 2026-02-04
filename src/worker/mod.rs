@@ -146,7 +146,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
 
         // 4. Run binary
         // Ensure assets are available
-        let asset_err = match data.ensure_assets_extracted() {
+        let asset_err = match data.ensure_assets_extracted(false) {
             Ok(_) => None,
             Err(e) => Some(e.to_string()),
         };

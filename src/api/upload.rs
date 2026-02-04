@@ -116,7 +116,7 @@ pub async fn upload_file(
         let base_dst = std::path::Path::new(&extract_dir).join("绳包").join("安卓基本库");
 
         // 3. Ensure stdlib is available (optional check here, mainly done at startup)
-        if let Err(e) = data.ensure_assets_extracted() {
+        if let Err(e) = data.ensure_assets_extracted(false) {
             log::error!("Failed to ensure assets extracted: {}", e);
             return Err(ApiError::InternalServerError);
         }
