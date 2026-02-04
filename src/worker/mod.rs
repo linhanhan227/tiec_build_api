@@ -73,9 +73,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                 continue;
             }
         };
-// ...
-// (I need to be careful not to delete the existing code, I'll use append or smart replace. 
-//  Since I cannot easily append, I will add the function at the END of the file or replacing the end of file)
+
         log::info!("Processing task: {}", task_id);
 
         let lease_task_id = task_id;
@@ -229,23 +227,34 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
 
         let error_seen = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let success_seen = Arc::new(AtomicBool::new(false));
 
         // 5. Monitor execution
         // We need to concurrently read logs and wait for exit
         let _data_clone = data.clone();
-        
+
+        let success_flag = success_seen.clone();
         let _log_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                log::info!("[Task {} Stdout]: {}", task_id, line);
+               // Some compiler versions may exit non-zero even if it reports success-with-warnings.
+               if line.contains("编译成功") {
+                    success_flag.store(true, Ordering::Relaxed);
+               }
                // Parse line for progress if possible
             }
         });
-        
+
         let err_flag = error_seen.clone();
         let err_msg = last_error.clone();
+        let success_flag2 = success_seen.clone();
         let _err_task = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
                 log::error!("[Task {} Stderr]: {}", task_id, line);
+                // Some builds may print success messages to stderr as well.
+                if line.contains("编译成功") {
+                    success_flag2.store(true, Ordering::Relaxed);
+                }
                 if line.contains("ERROR") || line.contains("错误") {
                     err_flag.store(true, Ordering::Relaxed);
                     let mut guard = err_msg.lock().await;
@@ -264,8 +273,8 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                         .clone()
                         .unwrap_or_else(|| "Compiler error log detected".to_string());
                     fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
-                } else if status.success() {
-                    // Find APK file in build directory
+                } else if status.success() || success_seen.load(Ordering::Relaxed) {
+                    // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
                     let apk_path = find_apk_file(&build_output_dir).await;
                     if let Some(apk_file) = apk_path {
                         update_progress(&data, task_id, 100, "Build successful").await;
