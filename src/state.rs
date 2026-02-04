@@ -113,15 +113,15 @@ impl AppState {
         }
     }
 
-    pub fn ensure_assets_extracted(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn ensure_assets_extracted(&self, force: bool) -> Result<(), Box<dyn std::error::Error>> {
         // .tiec is the root for runtime assets
         let tiecc_path = std::path::Path::new(&self.tiecc_dir);
         let stdlib_path = std::path::Path::new(&self.stdlib_dir);
         let root_dir = tiecc_path.parent().unwrap_or(std::path::Path::new("./.tiec"));
 
-        // Only initialize on first run or when .tiec is incomplete
-        if !tiecc_path.exists() || !stdlib_path.exists() {
-            log::info!("Assets missing or incomplete. Initializing embedded assets to {:?}", root_dir);
+        // Only initialize on first run or when .tiec is incomplete, or if forced
+        if force || !tiecc_path.exists() || !stdlib_path.exists() {
+            log::info!("Assets missing, incomplete, or forced update. Initializing embedded assets to {:?}", root_dir);
             std::fs::create_dir_all(root_dir)?;
 
             for asset in ASSETS {
