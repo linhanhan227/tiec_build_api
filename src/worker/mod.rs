@@ -275,6 +275,44 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                     fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
                 } else if status.success() || success_seen.load(Ordering::Relaxed) {
                     // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
+                    
+                    // Run gradlew assembleRelease explicitly
+                    update_progress(&data, task_id, 80, "Packaging APK (gradlew)...").await;
+                    let gradle_cmd = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
+                    let gradle_dir = format!("{}/build", project_dir);
+                    let mut gradle_process = Command::new(format!("./{}", gradle_cmd));
+                    gradle_process.current_dir(&gradle_dir);
+                    gradle_process.arg("assembleRelease");
+                    
+                    // Make sure gradlew is executable on Unix
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let gradlew_path = std::path::Path::new(&gradle_dir).join("gradlew");
+                        if gradlew_path.exists() {
+                            if let Ok(metadata) = std::fs::metadata(&gradle_path) {
+                                let mut perms = metadata.permissions();
+                                perms.set_mode(0o755);
+                                let _ = std::fs::set_permissions(&gradle_path, perms);
+                            }
+                        }
+                    }
+
+                    match gradle_process.output().await {
+                         Ok(output) => {
+                            if !output.status.success() {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                log::warn!("gradlew assembleRelease failed: {}", stderr);
+                                // Continue to check for APK anyway, in case it was built despite error
+                            } else {
+                                log::info!("gradlew assembleRelease executed successfully");
+                            }
+                         },
+                         Err(e) => {
+                             log::warn!("Failed to execute gradlew: {}", e);
+                         }
+                    }
+
                     let apk_path = find_apk_file(&build_output_dir).await;
                     if let Some(apk_file) = apk_path {
                         update_progress(&data, task_id, 100, "Build successful").await;
@@ -284,7 +322,32 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                         update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
                         log::info!("Task {} completed successfully", task_id);
                     } else {
-                        fail_task(&data, task_id, "Build command succeeded but APK file not found".into(), TaskStatus::CompilationFailed).await;
+                        // Debugging: List files in build_output_dir to help diagnose
+                        let mut files_found = String::new();
+                        let mut queue = VecDeque::new();
+                        queue.push_back(std::path::PathBuf::from(&build_output_dir));
+                        let mut count = 0;
+                        
+                        while let Some(d) = queue.pop_front() {
+                            if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
+                                while let Ok(Some(e)) = entries.next_entry().await {
+                                    if e.path().is_dir() {
+                                        queue.push_back(e.path());
+                                    } else {
+                                        if count < 20 {
+                                            files_found.push_str(&format!("{}, ", e.path().display()));
+                                        }
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            if count >= 20 { break; }
+                        }
+                        if count >= 20 { files_found.push_str("..."); }
+                        
+                        let err_msg = format!("Build command succeeded but APK file not found in {}. Found: [{}]", build_output_dir, files_found);
+                        log::error!("Task {} failed: {}", task_id, err_msg);
+                        fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
                     }
                 } else {
                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
@@ -563,16 +626,23 @@ async fn find_apk_file(build_dir: &str) -> Option<String> {
         return None;
     }
     
-    let mut entries = match fs::read_dir(build_path).await {
-        Ok(e) => e,
-        Err(_) => return None,
-    };
-    
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "apk" {
-                return path.to_str().map(|s| s.to_string());
+    let mut queue = VecDeque::new();
+    queue.push_back(build_path.to_path_buf());
+
+    while let Some(current_dir) = queue.pop_front() {
+        let mut entries = match fs::read_dir(&current_dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push_back(path);
+            } else if let Some(ext) = path.extension() {
+                if ext == "apk" {
+                    return path.to_str().map(|s| s.to_string());
+                }
             }
         }
     }
