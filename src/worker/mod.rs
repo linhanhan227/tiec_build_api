@@ -276,42 +276,59 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                 } else if status.success() || success_seen.load(Ordering::Relaxed) {
                     // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
                     
-                    // Run gradlew assembleRelease explicitly
-                    update_progress(&data, task_id, 80, "Packaging APK...").await;
+                    // Run gradlew assembleRelease explicitly (release build)
+                    update_progress(&data, task_id, 80, "Packaging APK (release)...").await;
                     let gradle_dir_str = format!("{}/build", project_dir);
                     let gradle_dir = std::path::Path::new(&gradle_dir_str);
-                    
+
                     let gradlew_name = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
-                    let local_gradlew = gradle_dir.join(gradlew_name);
-                    
-                    let cmd_to_run = if local_gradlew.exists() {
+                    let project_root = std::path::Path::new(&project_dir);
+                    let local_gradlew_root = project_root.join(gradlew_name);
+                    let local_gradlew_build = gradle_dir.join(gradlew_name);
+
+                    let (cmd_to_run, work_dir) = if local_gradlew_root.exists() {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = std::fs::metadata(&local_gradlew) {
+                            if let Ok(metadata) = std::fs::metadata(&local_gradlew_root) {
                                 let mut perms = metadata.permissions();
                                 perms.set_mode(0o755);
-                                let _ = std::fs::set_permissions(&local_gradlew, perms);
+                                let _ = std::fs::set_permissions(&local_gradlew_root, perms);
                             }
                         }
-                        if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) }
+                        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
+                        (cmd, project_root)
+                    } else if local_gradlew_build.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(metadata) = std::fs::metadata(&local_gradlew_build) {
+                                let mut perms = metadata.permissions();
+                                perms.set_mode(0o755);
+                                let _ = std::fs::set_permissions(&local_gradlew_build, perms);
+                            }
+                        }
+                        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
+                        (cmd, gradle_dir)
                     } else {
-                         match Command::new("gradle").arg("-v").output().await {
+                        let system_gradle = match Command::new("gradle").arg("-v").output().await {
                             Ok(_) => "gradle".to_string(),
                             Err(_) => String::new(),
-                         }
+                        };
+                        (system_gradle, project_root)
                     };
 
                     let mut build_attempted = false;
                     if cmd_to_run.is_empty() {
-                         let msg = "未检测到 Gradle，请安装 Android SDK 和 Gradle";
-                         log::error!("Task {} failed: {}", task_id, msg);
-                         fail_task(&data, task_id, msg.to_string(), TaskStatus::CompilationFailed).await;
+                        let msg = "未检测到 Gradle，请安装 Android SDK 和 Gradle";
+                        log::error!("Task {} failed: {}", task_id, msg);
+                        fail_task(&data, task_id, msg.to_string(), TaskStatus::CompilationFailed).await;
                     } else {
                         build_attempted = true;
                         let mut gradle_process = Command::new(&cmd_to_run);
-                        gradle_process.current_dir(&gradle_dir);
+                        gradle_process.current_dir(work_dir);
                         gradle_process.arg("assembleRelease");
+                        gradle_process.arg("--no-daemon");
 
                         match gradle_process.output().await {
                              Ok(output) => {
@@ -329,7 +346,11 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                     }
 
                     if build_attempted {
-                        let apk_path = find_apk_file(&build_output_dir).await;
+                        let gradle_apk_dir = format!("{}/outputs/apk", gradle_dir_str);
+                        let mut apk_path = find_apk_file(&gradle_apk_dir).await;
+                        if apk_path.is_none() {
+                            apk_path = find_apk_file(&build_output_dir).await;
+                        }
                         if let Some(apk_file) = apk_path {
                             update_progress(&data, task_id, 100, "Build successful").await;
                             if let Some(mut task) = data.tasks.get_mut(&task_id) {
