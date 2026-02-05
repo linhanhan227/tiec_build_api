@@ -108,7 +108,7 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let unzip_dir = format!("{}/{}_extracted", data.upload_dir, file_stem);
+            let unzip_dir = format!("{}/{}", data.upload_dir, file_stem);
 
             if let Err(e) = fs::create_dir_all(&unzip_dir).await {
                 fail_task(&data, task_id, format!("Failed to create source dir: {}", e), TaskStatus::CompilationFailed).await;
@@ -352,12 +352,53 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                             apk_path = find_apk_file(&build_output_dir).await;
                         }
                         if let Some(apk_file) = apk_path {
-                            update_progress(&data, task_id, 100, "Build successful").await;
-                            if let Some(mut task) = data.tasks.get_mut(&task_id) {
-                                task.output_path = Some(apk_file);
+                            update_progress(&data, task_id, 99, "Finalizing package...").await;
+
+                            // Move APK to upload dir to survive cleanup
+                            let apk_path_path = std::path::Path::new(&apk_file);
+                            let new_filename = format!("app-{}.apk", task_id);
+                            let dest_path_buf = std::path::Path::new(&data.upload_dir).join(&new_filename);
+                            let dest_path = dest_path_buf.to_string_lossy().to_string();
+
+                            let mut move_success = false;
+                            if let Err(e) = tokio::fs::rename(apk_path_path, &dest_path_buf).await {
+                                log::warn!("Failed to move APK via rename, trying copy: {}", e);
+                                if let Ok(_) = tokio::fs::copy(apk_path_path, &dest_path_buf).await {
+                                    move_success = true;
+                                    // Try to delete original if copy succeeded
+                                    let _ = tokio::fs::remove_file(apk_path_path).await;
+                                }
+                            } else {
+                                move_success = true;
                             }
-                            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
-                            log::info!("Task {} completed successfully", task_id);
+
+                            if move_success {
+                                if let Some(mut task) = data.tasks.get_mut(&task_id) {
+                                    task.output_path = Some(dest_path.clone());
+                                }
+                                update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
+                                log::info!("Task {} completed successfully. APK stored at {}", task_id, dest_path);
+
+                                // Cleanup source files immediately after success
+                                let project_dir_cleanup = project_dir.clone();
+                                let zip_file_cleanup = file_path.clone();
+                                
+                                tokio::spawn(async move {
+                                    // Remove extracted project directory
+                                    if let Err(e) = tokio::fs::remove_dir_all(&project_dir_cleanup).await {
+                                        log::debug!("Cleanup: Failed to remove project dir: {}", e);
+                                    }
+                                    
+                                    // Remove source zip if it exists and is a file
+                                    let zip_path = std::path::Path::new(&zip_file_cleanup);
+                                    if zip_path.is_file() {
+                                        let _ = tokio::fs::remove_file(zip_path).await;
+                                    }
+                                });
+                            } else {
+                                let err_msg = "Failed to save final APK file".to_string();
+                                fail_task(&data, task_id, err_msg, TaskStatus::UnknownError).await;
+                            }
                         } else {
                             // Debugging: List files in build_output_dir to help diagnose
                             let mut files_found = String::new();
@@ -439,10 +480,10 @@ async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step
 async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_status: TaskStatus) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
         // Retry logic:
-        // - Only retry if status is Timeout (transient error).
-        // - All other errors (CompilationFailed, UnknownError) are treated as fatal and not retryable.
-        let is_timeout = matches!(final_status, TaskStatus::Timeout);
-        let should_retry = is_timeout && task.retry_count < task.max_retries;
+        // - Only retry if status is Timeout (transient error) or UnknownError.
+        // - CompilationFailed is treated as fatal and not retryable.
+        let is_retriable = matches!(final_status, TaskStatus::Timeout | TaskStatus::UnknownError);
+        let should_retry = is_retriable && task.retry_count < task.max_retries;
 
         if should_retry {
             // Increment retry count
@@ -450,20 +491,16 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
             let backoff_secs = compute_retry_delay_seconds(task.retry_count);
             let next_run_at = Utc::now() + chrono::Duration::seconds(backoff_secs);
             
-            let retry_msg = format!("Retry {}/{}: scheduled in {}s. Error: {}", 
-                                    task.retry_count, task.max_retries, backoff_secs, error);
+            let retry_reason = if error.is_empty() { "Unknown error".to_string() } else { error.clone() };
+            let retry_msg = format!("Retry {}/{}: scheduled in {}s. Reason: {}", 
+                                    task.retry_count, task.max_retries, backoff_secs, retry_reason);
             
             // Update in-memory state
             task.status = TaskStatus::Queued;
             task.progress = 0; // Reset progress
             task.current_step = Some(format!("Waiting for retry (backoff {}s)", backoff_secs));
             
-            // Don't overwrite `error` with retry message if we want to see the original error in logs? 
-            // Better to prepend/append. But `error` field in Task is usually "last error".
-            // However, user said "already reported error but still retries". 
-            // They might mean the API response shows "Error: ..." but status is something else?
-            // If status is Queued, the user sees "Queued" but with an error message?
-            // Let's explicitly set error to indicate it's a transient failure.
+            // Set error to indicate it's a transient failure, but keep history
             task.error = Some(retry_msg.clone());
             task.updated_at = Utc::now();
             
@@ -471,16 +508,10 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                        task_id, task.retry_count, task.max_retries, next_run_at, backoff_secs);
 
             // Update database (schedules retry and clears lease)
-            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &error).await {
+            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &retry_msg).await {
                 log::error!("Failed to schedule retry for task {}: {}", task_id, e);
             }
             
-            // Also update the task definition in DB to persist retry_count and such
-            // IMPORTANT: We need to make sure we don't overwrite the schedule_retry updates (status/next_run_at)
-            // update_task updates status too. It uses `task.status` which we set to Queued above.
-            // update_task DOES NOT update `next_run_at`.
-            // So calling update_task AFTER schedule_retry is fine, provided `next_run_at` is not touched by update_task.
-            // `update_task` implementation: updates status, progress, ..., retry_count. Correct.
             if let Err(e) = data.database.update_task(&task).await {
                 log::error!("Failed to update task retry state for {}: {}", task_id, e);
             }
@@ -489,13 +520,23 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
             // Max retries reached, mark as permanently failed
             log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
 
-            let is_timeout = matches!(final_status, TaskStatus::Timeout);
-            // User requested specific error messages for API response
-            let failed_msg = if is_timeout { "任务超时，请重新上传打包" } else { "任务失败" };
+            let failed_msg = match final_status {
+                TaskStatus::Timeout => "任务超时，请重新上传打包",
+                TaskStatus::CompilationFailed => "编译失败，请检查代码",
+                TaskStatus::Cancelled => "任务已取消",
+                _ => "任务失败"
+            };
             
             task.status = final_status.clone();
-            task.current_step = Some(failed_msg.into());
-            task.error = Some(failed_msg.into()); 
+            task.current_step = Some(failed_msg.to_string());
+            
+            // Combine friendly message with detailed error
+            if !error.is_empty() && error != failed_msg {
+                task.error = Some(format!("{}: {}", failed_msg, error)); 
+            } else {
+                task.error = Some(failed_msg.to_string());
+            }
+
             task.updated_at = Utc::now();
             
             // Update stats
@@ -543,7 +584,7 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                 // 2. Remove extracted directory
                 // We check for extracted dir existence independently of source file status
                 if let Some(s) = stem {
-                     let extract_dir = format!("{}/{}_extracted", upload_dir, s);
+                     let extract_dir = format!("{}/{}", upload_dir, s);
                      let extract_path = std::path::Path::new(&extract_dir);
                      if extract_path.exists() {
                          if let Err(e) = tokio::fs::remove_dir_all(extract_path).await {
@@ -709,7 +750,7 @@ fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     // If we have a stem, we should check for an extracted directory regardless of whether the source file is currently present.
     // Source file might have been deleted in step 1 or previously.
     if let Some(stem_str) = stem {
-         let extracted_dir = std::path::Path::new(upload_dir).join(format!("{}_extracted", stem_str));
+         let extracted_dir = std::path::Path::new(upload_dir).join(format!("{}", stem_str));
          if extracted_dir.exists() {
             if let Err(e) = std::fs::remove_dir_all(&extracted_dir) {
                 log::warn!("Failed to remove extracted dir {}: {}", extracted_dir.display(), e);

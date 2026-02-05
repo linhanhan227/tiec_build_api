@@ -16,7 +16,7 @@ pub async fn create_build_task_for_user(
         return Err(ApiError::BadRequest("Invalid File ID format".into()));
     }
 
-    let extracted_dir = format!("{}/{}_extracted", data.upload_dir, file_id_str);
+    let extracted_dir = format!("{}/{}", data.upload_dir, file_id_str);
     let tsp_path = format!("{}/{}.tsp", data.upload_dir, file_id_str);
     let file_path = if std::path::Path::new(&extracted_dir).exists() {
         extracted_dir

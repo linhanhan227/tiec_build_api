@@ -108,7 +108,7 @@ pub async fn upload_file(
         }
 
         // 4. Extract ZIP file and copy 安卓基本库 to project root/绳包
-        let extract_dir = format!("{}/{}_extracted", data.upload_dir, sha1_hex);
+        let extract_dir = format!("{}/{}", data.upload_dir, sha1_hex);
         let tiec_root = std::path::Path::new(&data.tiecc_dir)
             .parent()
             .unwrap_or(std::path::Path::new("./.tiec"));

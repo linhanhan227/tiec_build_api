@@ -125,7 +125,7 @@ http://localhost:8080/swagger-ui/
 ## 运行时目录/文件
 
 - 上传目录：`UPLOAD_DIR`（默认 ./.tiec/uploads）
-- 解压目录：`{UPLOAD_DIR}/{file_id}_extracted`
+- 解压目录：`{UPLOAD_DIR}/{file_id}`
 - 内置资源：`.tiec/stdlib`、`.tiec/tiecc`（启动时自动解压）
 - Android 基础库：`.tiec/安卓基本库`（启动时初始化）
 - SQLite 数据库：`DATABASE_PATH`（默认 ./.tiec/tasks.db）

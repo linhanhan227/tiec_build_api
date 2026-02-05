@@ -113,7 +113,7 @@
 }
 ```
 
-- `status` 可选值：`排队中`、`处理中`、`成功`、`失败`、`已取消`
+- `status` 可选值：`排队中`、`处理中`、`编译成功`、`未知错误`、`编译失败`、`编译超时`、`已取消`
 - `progress`：0-100
 
 ### 4.5 TaskEvent
@@ -217,7 +217,7 @@ curl http://localhost:8080/health
 #### 行为
 
 - 生成 `file_id`（SHA1）
-- 解压到 `UPLOAD_DIR/{file_id}_extracted`
+- 解压到 `UPLOAD_DIR/{file_id}`
 - 首次启动时由服务初始化基础资源与标准库
 
 #### 响应
@@ -395,7 +395,7 @@ curl "http://localhost:8080/api/v1/build/{id}/events?limit=50&offset=0"
 
 #### 说明
 
-仅当任务状态为 `成功` 时可下载。
+仅当任务状态为 `编译成功` 时可下载。
 
 #### 响应
 
@@ -442,7 +442,9 @@ curl http://localhost:8080/api-docs/openapi.json
 | WORKER_COUNT | 1 | 工作线程数 |
 | TASK_TIMEOUT | 900 | 单任务超时（秒） |
 | CLEANUP_INTERVAL | 3600 | 清理任务间隔（秒） |
+| CLEANUP_RETENTION_SECS | 86400 | 清理时保留多久内的过期任务（秒） |
 | HOURLY_IP_LIMIT | 20 | 每 IP 每小时限制（仅限部分 API） |
+| MAX_RETRIES | 3 | 任务最大重试次数 |
 
 ### build-test 测试参数（可选）
 
@@ -460,7 +462,8 @@ build-test 通过 **真实 API 流程**（/api/v1/upload、/api/v1/build）测�
 	"queue_capacity": 30,
 	"cleanup_interval": 30,
 	"cleanup_retention_secs": 15,
-	"hourly_ip_limit": 60
+	"hourly_ip_limit": 60,
+    "max_retries": 3
 }
 ```
 
