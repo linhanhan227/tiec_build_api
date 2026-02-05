@@ -586,7 +586,54 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
         };
 
         let mut cleaned = 0usize;
+        let mut timeout_marked = 0usize;
         for task in tasks {
+            // 1) 对超时的处理中任务先标记为 Timeout，保留一段时间供查询
+            if task.status == crate::models::TaskStatus::Processing && task.updated_at < timeout_cutoff {
+                let mut updated_task = task.clone();
+                updated_task.status = crate::models::TaskStatus::Timeout;
+                updated_task.error = Some("Build timed out (cleanup)".into());
+                updated_task.current_step = Some("Timeout".into());
+                updated_task.updated_at = chrono::Utc::now();
+
+                if let Some(mut mem_task) = data.tasks.get_mut(&task.task_id) {
+                    mem_task.status = updated_task.status.clone();
+                    mem_task.error = updated_task.error.clone();
+                    mem_task.current_step = updated_task.current_step.clone();
+                    mem_task.updated_at = updated_task.updated_at;
+                }
+
+                if let Err(e) = data.database.update_task(&updated_task).await {
+                    log::warn!("Failed to mark task {} as timeout: {}", task.task_id, e);
+                }
+
+                if let Err(e) = data.database.insert_task_event(
+                    &task.task_id,
+                    "status_change",
+                    Some(crate::models::TaskStatus::Timeout),
+                    Some("Build timed out (cleanup)"),
+                    None,
+                ).await {
+                    log::warn!("Failed to write timeout event for {}: {}", task.task_id, e);
+                }
+
+                // 清理文件（目录与同名 tsp），任务记录暂时保留
+                cleanup_task_files(&data.upload_dir, &updated_task);
+
+                timeout_marked += 1;
+                continue;
+            }
+
+            // 2) 对失败/超时任务，先清理文件，再按保留窗口删除记录
+            if matches!(
+                task.status,
+                crate::models::TaskStatus::UnknownError
+                    | crate::models::TaskStatus::Timeout
+                    | crate::models::TaskStatus::CompilationFailed
+            ) {
+                cleanup_task_files(&data.upload_dir, &task);
+            }
+
             let should_cleanup = match task.status {
                 crate::models::TaskStatus::Success => task.updated_at < completed_cutoff,
                 crate::models::TaskStatus::UnknownError => task.updated_at < failed_cutoff,
@@ -594,7 +641,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
                 crate::models::TaskStatus::CompilationFailed => task.updated_at < failed_cutoff,
                 crate::models::TaskStatus::Cancelled => task.updated_at < expired_cutoff,
                 crate::models::TaskStatus::Queued => task.updated_at < expired_cutoff,
-                crate::models::TaskStatus::Processing => task.updated_at < timeout_cutoff,
+                crate::models::TaskStatus::Processing => false,
             };
 
             if !should_cleanup {
@@ -613,7 +660,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
             log::info!("已清理过期/超时任务：{}", task.task_id);
         }
 
-        if cleaned > 0 {
+        if cleaned > 0 || timeout_marked > 0 {
             if let Ok((total, completed, failed, _)) = data.database.get_task_stats().await {
                 data.total_tasks.store(total, std::sync::atomic::Ordering::Relaxed);
                 data.completed_tasks.store(completed, std::sync::atomic::Ordering::Relaxed);
