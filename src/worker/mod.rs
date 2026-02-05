@@ -277,77 +277,94 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                     // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
                     
                     // Run gradlew assembleRelease explicitly
-                    update_progress(&data, task_id, 80, "Packaging APK (gradlew)...").await;
-                    let gradle_cmd = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
-                    let gradle_dir = format!("{}/build", project_dir);
-                    let mut gradle_process = Command::new(format!("./{}", gradle_cmd));
-                    gradle_process.current_dir(&gradle_dir);
-                    gradle_process.arg("assembleRelease");
+                    update_progress(&data, task_id, 80, "Packaging APK...").await;
+                    let gradle_dir_str = format!("{}/build", project_dir);
+                    let gradle_dir = std::path::Path::new(&gradle_dir_str);
                     
-                    // Make sure gradlew is executable on Unix
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let gradlew_path = std::path::Path::new(&gradle_dir).join("gradlew");
-                        if gradlew_path.exists() {
-                            if let Ok(metadata) = std::fs::metadata(&gradle_path) {
+                    let gradlew_name = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
+                    let local_gradlew = gradle_dir.join(gradlew_name);
+                    
+                    let cmd_to_run = if local_gradlew.exists() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(metadata) = std::fs::metadata(&local_gradlew) {
                                 let mut perms = metadata.permissions();
                                 perms.set_mode(0o755);
-                                let _ = std::fs::set_permissions(&gradle_path, perms);
+                                let _ = std::fs::set_permissions(&local_gradlew, perms);
                             }
                         }
-                    }
-
-                    match gradle_process.output().await {
-                         Ok(output) => {
-                            if !output.status.success() {
-                                let stderr = String::from_utf8_lossy(&output.stderr);
-                                log::warn!("gradlew assembleRelease failed: {}", stderr);
-                                // Continue to check for APK anyway, in case it was built despite error
-                            } else {
-                                log::info!("gradlew assembleRelease executed successfully");
-                            }
-                         },
-                         Err(e) => {
-                             log::warn!("Failed to execute gradlew: {}", e);
-                         }
-                    }
-
-                    let apk_path = find_apk_file(&build_output_dir).await;
-                    if let Some(apk_file) = apk_path {
-                        update_progress(&data, task_id, 100, "Build successful").await;
-                        if let Some(mut task) = data.tasks.get_mut(&task_id) {
-                            task.output_path = Some(apk_file);
-                        }
-                        update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
-                        log::info!("Task {} completed successfully", task_id);
+                        if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) }
                     } else {
-                        // Debugging: List files in build_output_dir to help diagnose
-                        let mut files_found = String::new();
-                        let mut queue = VecDeque::new();
-                        queue.push_back(std::path::PathBuf::from(&build_output_dir));
-                        let mut count = 0;
-                        
-                        while let Some(d) = queue.pop_front() {
-                            if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
-                                while let Ok(Some(e)) = entries.next_entry().await {
-                                    if e.path().is_dir() {
-                                        queue.push_back(e.path());
-                                    } else {
-                                        if count < 20 {
-                                            files_found.push_str(&format!("{}, ", e.path().display()));
+                         match Command::new("gradle").arg("-v").output().await {
+                            Ok(_) => "gradle".to_string(),
+                            Err(_) => String::new(),
+                         }
+                    };
+
+                    let mut build_attempted = false;
+                    if cmd_to_run.is_empty() {
+                         let msg = "未检测到 Gradle，请安装 Android SDK 和 Gradle";
+                         log::error!("Task {} failed: {}", task_id, msg);
+                         fail_task(&data, task_id, msg.to_string(), TaskStatus::CompilationFailed).await;
+                    } else {
+                        build_attempted = true;
+                        let mut gradle_process = Command::new(&cmd_to_run);
+                        gradle_process.current_dir(&gradle_dir);
+                        gradle_process.arg("assembleRelease");
+
+                        match gradle_process.output().await {
+                             Ok(output) => {
+                                if !output.status.success() {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    log::warn!("Gradle build failed: {}", stderr);
+                                } else {
+                                    log::info!("Gradle build success");
+                                }
+                             },
+                             Err(e) => {
+                                 log::warn!("Failed to execute gradle: {}", e);
+                             }
+                        }
+                    }
+
+                    if build_attempted {
+                        let apk_path = find_apk_file(&build_output_dir).await;
+                        if let Some(apk_file) = apk_path {
+                            update_progress(&data, task_id, 100, "Build successful").await;
+                            if let Some(mut task) = data.tasks.get_mut(&task_id) {
+                                task.output_path = Some(apk_file);
+                            }
+                            update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
+                            log::info!("Task {} completed successfully", task_id);
+                        } else {
+                            // Debugging: List files in build_output_dir to help diagnose
+                            let mut files_found = String::new();
+                            let mut queue = VecDeque::new();
+                            queue.push_back(std::path::PathBuf::from(&build_output_dir));
+                            let mut count = 0;
+                            
+                            while let Some(d) = queue.pop_front() {
+                                if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
+                                    while let Ok(Some(e)) = entries.next_entry().await {
+                                        if e.path().is_dir() {
+                                            queue.push_back(e.path());
+                                        } else {
+                                            if count < 20 {
+                                                files_found.push_str(&format!("{}, ", e.path().display()));
+                                            }
+                                            count += 1;
                                         }
-                                        count += 1;
                                     }
                                 }
+                                if count >= 20 { break; }
                             }
-                            if count >= 20 { break; }
+                            if count >= 20 { files_found.push_str("..."); }
+                            
+                            let err_msg = format!("Build command succeeded but APK file not found in {}. Found: [{}]", build_output_dir, files_found);
+                            log::error!("Task {} failed: {}", task_id, err_msg);
+                            fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
                         }
-                        if count >= 20 { files_found.push_str("..."); }
-                        
-                        let err_msg = format!("Build command succeeded but APK file not found in {}. Found: [{}]", build_output_dir, files_found);
-                        log::error!("Task {} failed: {}", task_id, err_msg);
-                        fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
                     }
                 } else {
                     fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
@@ -487,7 +504,10 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                 log::info!("Cleaning up files for failed/timeout task {}", task_id_clone);
                 let path = std::path::Path::new(&file_path);
                 
-                // 1. Remove original uploaded file
+                // Keep stem for extracted dir check even if file assumes deletion
+                let stem = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+
+                // 1. Remove original uploaded file/folder
                 if path.exists() {
                     let res = if path.is_dir() {
                         tokio::fs::remove_dir_all(path).await
@@ -500,16 +520,15 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
                 }
 
                 // 2. Remove extracted directory
-                if !path.is_dir() {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                         let extract_dir = format!("{}/{}_extracted", upload_dir, stem);
-                         let extract_path = std::path::Path::new(&extract_dir);
-                         if extract_path.exists() {
-                             if let Err(e) = tokio::fs::remove_dir_all(extract_path).await {
-                                 log::warn!("Failed to delete extracted dir {}: {}", extract_dir, e);
-                             }
+                // We check for extracted dir existence independently of source file status
+                if let Some(s) = stem {
+                     let extract_dir = format!("{}/{}_extracted", upload_dir, s);
+                     let extract_path = std::path::Path::new(&extract_dir);
+                     if extract_path.exists() {
+                         if let Err(e) = tokio::fs::remove_dir_all(extract_path).await {
+                             log::warn!("Failed to delete extracted dir {}: {}", extract_dir, e);
                          }
-                    }
+                     }
                 }
 
             });
@@ -585,16 +604,28 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
 
 fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     let file_path = std::path::Path::new(&task.file_path);
+    let stem = file_path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+    
+    // 1. Delete source file (TSP file or directory)
+    // We try to delete even if exists() returns false to handle race conditions or partial deletions gracefully
+    // But since remove methods fail if not exists, we can just check existence.
+    // Importantly, we capture is_dir before deletion if possible, but if it doesn't exist we guess based on extension or just skip logic that depends on type.
     if file_path.exists() {
         if file_path.is_dir() {
             if let Err(e) = std::fs::remove_dir_all(file_path) {
                 log::warn!("Failed to remove task dir {}: {}", file_path.display(), e);
             }
-        } else if let Err(e) = std::fs::remove_file(file_path) {
-            log::warn!("Failed to remove task file {}: {}", file_path.display(), e);
+        } else {
+             if let Err(e) = std::fs::remove_file(file_path) {
+                log::warn!("Failed to remove task file {}: {}", file_path.display(), e);
+            }
         }
+    } else {
+        // Log that file was missing, might have been cleaned up already
+        log::debug!("Task file {} already removed or missing", file_path.display());
     }
 
+    // 2. Output artifacts
     if let Some(output_path) = task.output_path.as_ref() {
         let output = std::path::Path::new(output_path);
         if output.exists() {
@@ -606,15 +637,16 @@ fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
         }
     }
 
-    if file_path.is_file() {
-        if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
-            let extracted_dir = std::path::Path::new(upload_dir).join(format!("{}_extracted", stem));
-            if extracted_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&extracted_dir) {
-                    log::warn!("Failed to remove extracted dir {}: {}", extracted_dir.display(), e);
-                }
+    // 3. Extracted directory
+    // If we have a stem, we should check for an extracted directory regardless of whether the source file is currently present.
+    // Source file might have been deleted in step 1 or previously.
+    if let Some(stem_str) = stem {
+         let extracted_dir = std::path::Path::new(upload_dir).join(format!("{}_extracted", stem_str));
+         if extracted_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&extracted_dir) {
+                log::warn!("Failed to remove extracted dir {}: {}", extracted_dir.display(), e);
             }
-        }
+         }
     }
 }
 
