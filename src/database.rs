@@ -479,31 +479,31 @@ impl Database {
         Ok(())
     }
 
-    pub async fn schedule_retry(&self, task_id: &Uuid, next_run_at: DateTime<Utc>, last_error: &str) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE tasks SET status = ?, next_run_at = ?, last_error = ?, updated_at = ?, lease_until = NULL, locked_by = NULL WHERE task_id = ?",
-            rusqlite::params![
-                serde_json::to_string(&TaskStatus::Queued).unwrap(),
-                next_run_at.to_rfc3339(),
-                last_error,
-                Utc::now().to_rfc3339(),
-                task_id.to_string(),
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                task_id.to_string(),
-                "retry_scheduled",
-                serde_json::to_string(&TaskStatus::Queued).unwrap(),
-                last_error,
-                Option::<String>::None,
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
+    // pub async fn schedule_retry(&self, task_id: &Uuid, next_run_at: DateTime<Utc>, last_error: &str) -> Result<()> {
+    //     let conn = self.conn.lock().await;
+    //     conn.execute(
+    //         "UPDATE tasks SET status = ?, next_run_at = ?, last_error = ?, updated_at = ?, lease_until = NULL, locked_by = NULL WHERE task_id = ?",
+    //         rusqlite::params![
+    //             serde_json::to_string(&TaskStatus::Queued).unwrap(),
+    //             next_run_at.to_rfc3339(),
+    //             last_error,
+    //             Utc::now().to_rfc3339(),
+    //             task_id.to_string(),
+    //         ],
+    //     )?;
+    //     conn.execute(
+    //         "INSERT INTO task_events (task_id, event_type, status, message, worker_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    //         rusqlite::params![
+    //             task_id.to_string(),
+    //             "retry_scheduled",
+    //             serde_json::to_string(&TaskStatus::Queued).unwrap(),
+    //             last_error,
+    //             Option::<String>::None,
+    //             Utc::now().to_rfc3339(),
+    //         ],
+    //     )?;
+    //     Ok(())
+    // }
 
     pub async fn insert_task_event(
         &self,

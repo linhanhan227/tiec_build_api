@@ -28,9 +28,9 @@ impl Config {
                 .parse()
                 .unwrap_or(1),
             task_timeout: std::env::var("TASK_TIMEOUT")
-                .unwrap_or_else(|_| "900".into())
+                .unwrap_or_else(|_| "1200".into())
                 .parse()
-                .unwrap_or(900),
+                .unwrap_or(1200),
             cleanup_interval: std::env::var("CLEANUP_INTERVAL")
                 .unwrap_or_else(|_| "3600".into())
                 .parse()
@@ -44,9 +44,9 @@ impl Config {
                 .parse()
                 .unwrap_or(20),
             max_retries: std::env::var("MAX_RETRIES")
-                .unwrap_or_else(|_| "3".into())
+                .unwrap_or_else(|_| "0".into())
                 .parse()
-                .unwrap_or(3),
+                .unwrap_or(0),
         }
     }
 }

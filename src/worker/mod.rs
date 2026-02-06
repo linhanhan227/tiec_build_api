@@ -88,381 +88,307 @@ pub async fn run_worker(data: Arc<AppState>, _task_queue: Arc<tokio::sync::Mutex
                 }
             }
         });
-        
-        // 1. Update status to Processing
-        update_task_status(&data, &task_id, TaskStatus::Processing, 5, Some("Initializing environment".into()), None).await;
 
-        // 2. Prepare paths
-        let (file_path, _file_id, _user_id) = if let Some(task) = data.tasks.get(&task_id) {
-            (task.file_path.clone(), task.file_id.clone(), task.user_id.clone())
-        } else {
-            stop_lease(&data, &task_id, &lease_handle).await;
-            continue;
-        };
-
-
-        let mut project_dir = file_path.clone();
-
-        if !std::path::Path::new(&file_path).is_dir() {
-            let file_stem = std::path::Path::new(&file_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            let unzip_dir = format!("{}/{}", data.upload_dir, file_stem);
-
-            if let Err(e) = fs::create_dir_all(&unzip_dir).await {
-                fail_task(&data, task_id, format!("Failed to create source dir: {}", e), TaskStatus::CompilationFailed).await;
-                stop_lease(&data, &task_id, &lease_handle).await;
-                continue;
+        // Use a unified structure to handle task execution and error propagation.
+        // This avoids scattered fail_task/stop_lease calls.
+        match execute_task(&data, task_id, task_timeout).await {
+            Ok(_) => {
+                log::info!("Task {} completed successfully execution flow", task_id);
             }
-
-            // 3. Unzip
-            update_progress(&data, task_id, 10, "Extracting project...").await;
-            let file_path_clone = file_path.clone();
-            let unzip_dir_clone = unzip_dir.clone();
-
-            let unzip_result = web::block(move || -> Result<(), std::io::Error> {
-                let file = std::fs::File::open(file_path_clone)?;
-                let mut archive = zip::ZipArchive::new(file)?;
-                use crate::utils::extract_zip_from_archive; // Use the safe extraction
-                extract_zip_from_archive(&mut archive, &std::path::Path::new(&unzip_dir_clone))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                Ok(())
-            }).await;
-
-            match unzip_result {
-                Ok(Ok(_)) => {},
-                _ => {
-                    fail_task(&data, task_id, "Failed to extract project".into(), TaskStatus::CompilationFailed).await;
-                    stop_lease(&data, &task_id, &lease_handle).await;
-                    continue;
-                }
-            }
-
-            // 3.5. Use extracted directory as project directory
-            update_progress(&data, task_id, 15, "Organizing project files...").await;
-            project_dir = unzip_dir.clone();
-        }
-
-        // 4. Run binary
-        // Ensure assets are available
-        let asset_err = match data.ensure_assets_extracted(false) {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
-        if let Some(err_msg) = asset_err {
-            fail_task(&data, task_id, format!("Failed to prepare assets: {}", err_msg), TaskStatus::CompilationFailed).await;
-            stop_lease(&data, &task_id, &lease_handle).await;
-            continue;
-        }
-
-        // Detect OS and architecture to choose binary path under .tiec/tiecc
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
-        let tiecc_root = std::path::Path::new(&data.tiecc_dir);
-
-        let binary_path = match (os, arch) {
-            ("macos", _) => tiecc_root.join("macos/tiec"),
-            ("linux", "x86_64") => tiecc_root.join("linux_x86_64/tiec"),
-            ("linux", "aarch64") => tiecc_root.join("linux_arm64-v8a/tiec"),
-            ("windows", "x86_64") => tiecc_root.join("win_x86_64/tiec.exe"),
-            _ => {
-                fail_task(&data, task_id, format!("Unsupported OS/arch: {}/{}", os, arch), TaskStatus::CompilationFailed).await;
-                stop_lease(&data, &task_id, &lease_handle).await;
-                continue;
-            }
-        };
-
-        if !binary_path.exists() {
-            fail_task(&data, task_id, format!("Compiler binary not found: {}", binary_path.display()), TaskStatus::CompilationFailed).await;
-            stop_lease(&data, &task_id, &lease_handle).await;
-            continue;
-        }
-
-        update_progress(&data, task_id, 20, "Starting build process...").await;
-
-        // Construct command
-        let build_output_dir = format!("{}/build", project_dir);
-        let app_config_root = format!("{}/project.json", project_dir);
-        let app_config_in_build = format!("{}/build/project.json", project_dir);
-
-        // Ensure app config at project root (remove build path usage)
-        if !std::path::Path::new(&app_config_root).exists()
-            && std::path::Path::new(&app_config_in_build).exists()
-        {
-            let _ = fs::copy(&app_config_in_build, &app_config_root).await;
-        }
-
-        let mut cmd = Command::new(&binary_path);
-        cmd.current_dir(&project_dir);
-        cmd.arg("-o").arg(&build_output_dir);
-        cmd.arg("--platform").arg("android");
-        cmd.arg("--android.gradle");
-        cmd.arg("--android.app.config").arg(&app_config_root);
-        cmd.arg("--release");
-        cmd.arg("--log-level").arg("error");
-        cmd.arg("--dir").arg(&project_dir);
-        
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        // Spawn the process
-        let child_result = cmd.spawn();
-        
-        let mut child = match child_result {
-            Ok(c) => c,
-            Err(e) => {
-                fail_task(&data, task_id, format!("Failed to spawn builder: {}", e), TaskStatus::CompilationFailed).await;
-                stop_lease(&data, &task_id, &lease_handle).await;
-                continue;
-            }
-        };
-
-        // Stream output
-        let stdout = child.stdout.take().expect("Failed to open stdout");
-        let stderr = child.stderr.take().expect("Failed to open stderr");
-        
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
-
-        let error_seen = Arc::new(AtomicBool::new(false));
-        let last_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
-        let success_seen = Arc::new(AtomicBool::new(false));
-
-        // 5. Monitor execution
-        // We need to concurrently read logs and wait for exit
-        let _data_clone = data.clone();
-
-        let success_flag = success_seen.clone();
-        let _log_task = tokio::spawn(async move {
-            while let Ok(Some(line)) = stdout_reader.next_line().await {
-               log::info!("[Task {} Stdout]: {}", task_id, line);
-               // Some compiler versions may exit non-zero even if it reports success-with-warnings.
-               if line.contains("编译成功") {
-                    success_flag.store(true, Ordering::Relaxed);
-               }
-               // Parse line for progress if possible
-            }
-        });
-
-        let err_flag = error_seen.clone();
-        let err_msg = last_error.clone();
-        let success_flag2 = success_seen.clone();
-        let _err_task = tokio::spawn(async move {
-            while let Ok(Some(line)) = stderr_reader.next_line().await {
-                log::error!("[Task {} Stderr]: {}", task_id, line);
-                // Some builds may print success messages to stderr as well.
-                if line.contains("编译成功") {
-                    success_flag2.store(true, Ordering::Relaxed);
-                }
-                if line.contains("ERROR") || line.contains("错误") {
-                    err_flag.store(true, Ordering::Relaxed);
-                    let mut guard = err_msg.lock().await;
-                    *guard = Some(line.clone());
-                }
-            }
-        });
-
-        // Use timeout
-        match tokio::time::timeout(std::time::Duration::from_secs(task_timeout), child.wait()).await {
-            Ok(Ok(status)) => {
-                if error_seen.load(Ordering::Relaxed) {
-                    let err_msg = last_error
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or_else(|| "Compiler error log detected".to_string());
-                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
-                } else if status.success() || success_seen.load(Ordering::Relaxed) {
-                    // Treat as success if logs contain "编译成功" (e.g. success with warnings but non-zero exit)
-                    
-                    // Run gradlew assembleRelease explicitly (release build)
-                    update_progress(&data, task_id, 80, "Packaging APK (release)...").await;
-                    let gradle_dir_str = format!("{}/build", project_dir);
-                    let gradle_dir = std::path::Path::new(&gradle_dir_str);
-
-                    let gradlew_name = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
-                    let project_root = std::path::Path::new(&project_dir);
-                    let local_gradlew_root = project_root.join(gradlew_name);
-                    let local_gradlew_build = gradle_dir.join(gradlew_name);
-
-                    let (cmd_to_run, work_dir) = if local_gradlew_root.exists() {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = std::fs::metadata(&local_gradlew_root) {
-                                let mut perms = metadata.permissions();
-                                perms.set_mode(0o755);
-                                let _ = std::fs::set_permissions(&local_gradlew_root, perms);
-                            }
-                        }
-                        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
-                        (cmd, project_root)
-                    } else if local_gradlew_build.exists() {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Ok(metadata) = std::fs::metadata(&local_gradlew_build) {
-                                let mut perms = metadata.permissions();
-                                perms.set_mode(0o755);
-                                let _ = std::fs::set_permissions(&local_gradlew_build, perms);
-                            }
-                        }
-                        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
-                        (cmd, gradle_dir)
-                    } else {
-                        let system_gradle = match Command::new("gradle").arg("-v").output().await {
-                            Ok(_) => "gradle".to_string(),
-                            Err(_) => String::new(),
-                        };
-                        (system_gradle, project_root)
-                    };
-
-                    let mut build_attempted = false;
-                    if cmd_to_run.is_empty() {
-                        let msg = "未检测到 Gradle，请安装 Android SDK 和 Gradle";
-                        log::error!("Task {} failed: {}", task_id, msg);
-                        fail_task(&data, task_id, msg.to_string(), TaskStatus::CompilationFailed).await;
-                    } else {
-                        build_attempted = true;
-                        let mut gradle_process = Command::new(&cmd_to_run);
-                        gradle_process.current_dir(work_dir);
-                        gradle_process.arg("assembleRelease");
-                        gradle_process.arg("--no-daemon");
-
-                        match gradle_process.output().await {
-                             Ok(output) => {
-                                if !output.status.success() {
-                                    let stderr = String::from_utf8_lossy(&output.stderr);
-                                    log::warn!("Gradle build failed: {}", stderr);
-                                } else {
-                                    log::info!("Gradle build success");
-                                }
-                             },
-                             Err(e) => {
-                                 log::warn!("Failed to execute gradle: {}", e);
-                             }
-                        }
-                    }
-
-                    if build_attempted {
-                        let gradle_apk_dir = format!("{}/outputs/apk", gradle_dir_str);
-                        let mut apk_path = find_apk_file(&gradle_apk_dir).await;
-                        if apk_path.is_none() {
-                            apk_path = find_apk_file(&build_output_dir).await;
-                        }
-                        if let Some(apk_file) = apk_path {
-                            update_progress(&data, task_id, 99, "Finalizing package...").await;
-
-                            // Move APK to upload dir to survive cleanup
-                            let apk_path_path = std::path::Path::new(&apk_file);
-                            let new_filename = format!("app-{}.apk", task_id);
-                            let dest_path_buf = std::path::Path::new(&data.upload_dir).join(&new_filename);
-                            let dest_path = dest_path_buf.to_string_lossy().to_string();
-
-                            let mut move_success = false;
-                            if let Err(e) = tokio::fs::rename(apk_path_path, &dest_path_buf).await {
-                                log::warn!("Failed to move APK via rename, trying copy: {}", e);
-                                if let Ok(_) = tokio::fs::copy(apk_path_path, &dest_path_buf).await {
-                                    move_success = true;
-                                    // Try to delete original if copy succeeded
-                                    let _ = tokio::fs::remove_file(apk_path_path).await;
-                                }
-                            } else {
-                                move_success = true;
-                            }
-
-                            if move_success {
-                                if let Some(mut task) = data.tasks.get_mut(&task_id) {
-                                    task.output_path = Some(dest_path.clone());
-                                }
-                                update_task_status(&data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
-                                log::info!("Task {} completed successfully. APK stored at {}", task_id, dest_path);
-
-                                // Cleanup source files immediately after success
-                                let project_dir_cleanup = project_dir.clone();
-                                let zip_file_cleanup = file_path.clone();
-                                
-                                tokio::spawn(async move {
-                                    // Remove extracted project directory
-                                    if let Err(e) = tokio::fs::remove_dir_all(&project_dir_cleanup).await {
-                                        log::debug!("Cleanup: Failed to remove project dir: {}", e);
-                                    }
-                                    
-                                    // Remove source zip if it exists and is a file
-                                    let zip_path = std::path::Path::new(&zip_file_cleanup);
-                                    if zip_path.is_file() {
-                                        let _ = tokio::fs::remove_file(zip_path).await;
-                                    }
-                                });
-                            } else {
-                                let err_msg = "Failed to save final APK file".to_string();
-                                fail_task(&data, task_id, err_msg, TaskStatus::UnknownError).await;
-                            }
-                        } else {
-                            // Debugging: List files in build_output_dir to help diagnose
-                            let mut files_found = String::new();
-                            let mut queue = VecDeque::new();
-                            queue.push_back(std::path::PathBuf::from(&build_output_dir));
-                            let mut count = 0;
-                            
-                            while let Some(d) = queue.pop_front() {
-                                if let Ok(mut entries) = tokio::fs::read_dir(&d).await {
-                                    while let Ok(Some(e)) = entries.next_entry().await {
-                                        if e.path().is_dir() {
-                                            queue.push_back(e.path());
-                                        } else {
-                                            if count < 20 {
-                                                files_found.push_str(&format!("{}, ", e.path().display()));
-                                            }
-                                            count += 1;
-                                        }
-                                    }
-                                }
-                                if count >= 20 { break; }
-                            }
-                            if count >= 20 { files_found.push_str("..."); }
-                            
-                            let err_msg = format!("Build command succeeded but APK file not found in {}. Found: [{}]", build_output_dir, files_found);
-                            log::error!("Task {} failed: {}", task_id, err_msg);
-                            fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
-                        }
-                    }
-                } else {
-                    fail_task(&data, task_id, format!("Build failed with exit code: {}", status), TaskStatus::CompilationFailed).await;
-                }
-            },
-            Ok(Err(e)) => {
-                if error_seen.load(Ordering::Relaxed) {
-                    let err_msg = last_error
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or_else(|| "Compiler error log detected".to_string());
-                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
-                } else {
-                    fail_task(&data, task_id, format!("Wait error: {}", e), TaskStatus::UnknownError).await;
-                }
-            },
-            Err(_) => {
-                let _ = child.kill().await;
-                if error_seen.load(Ordering::Relaxed) {
-                    let err_msg = last_error
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or_else(|| "Compiler error log detected".to_string());
-                    fail_task(&data, task_id, err_msg, TaskStatus::CompilationFailed).await;
-                } else {
-                    fail_task(&data, task_id, "Build timed out".into(), TaskStatus::Timeout).await;
-                }
+            Err((msg, status)) => {
+                 log::error!("Task {} execution failed: {}", task_id, msg);
+                 fail_task(&data, task_id, msg, status).await;
             }
         }
 
         stop_lease(&data, &task_id, &lease_handle).await;
-        
     }
 }
+
+async fn execute_task(data: &Arc<AppState>, task_id: Uuid, task_timeout: u64) -> Result<(), (String, TaskStatus)> {
+    // 1. Update status to Processing
+    update_task_status(data, &task_id, TaskStatus::Processing, 5, Some("Initializing environment".into()), None).await;
+
+    // 2. Prepare paths and unzip
+    let (project_dir, file_path) = prepare_project_source(data, task_id).await?;
+
+    // 3. Run binary (tiec construction)
+    // Ensure assets are available
+    if let Err(e) = data.ensure_assets_extracted(false) {
+        return Err((format!("Failed to prepare assets: {}", e), TaskStatus::CompilationFailed));
+    }
+    
+    let binary_path = get_compiler_binary_path(&data.tiecc_dir)
+        .ok_or_else(|| ("Compiler binary not found or unsupported OS".to_string(), TaskStatus::CompilationFailed))?;
+    
+    update_progress(data, task_id, 20, "Starting build process...").await;
+
+    let build_output_dir = format!("{}/build", project_dir);
+    let app_config_root = format!("{}/project.json", project_dir);
+    let app_config_in_build = format!("{}/build/project.json", project_dir);
+
+    // Ensure app config at project root logic
+    if !std::path::Path::new(&app_config_root).exists() && std::path::Path::new(&app_config_in_build).exists() {
+        let _ = fs::copy(&app_config_in_build, &app_config_root).await;
+    }
+
+    let mut cmd = Command::new(&binary_path);
+    cmd.current_dir(&project_dir);
+    cmd.arg("-o").arg(&build_output_dir);
+    cmd.arg("--platform").arg("android");
+    cmd.arg("--android.gradle");
+    cmd.arg("--android.app.config").arg(&app_config_root);
+    cmd.arg("--release");
+    cmd.arg("--log-level").arg("error");
+    cmd.arg("--dir").arg(&project_dir);
+    
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Spawn and Monitor
+    run_compiler_process(cmd, task_id, task_timeout).await
+        .map_err(|e| (e, TaskStatus::CompilationFailed))?;
+
+    // 4. Run Gradle Packaging
+    update_progress(data, task_id, 80, "Packaging APK (release)...").await;
+    if let Err(e) = run_gradle_build(&project_dir).await {
+         // Gradle errors are non-fatal in the original code sense if an apk is somehow found?
+         // But usually failure means no APK. The original code logged warning and continued to find_apk.
+         // We'll mimic that structure by just logging but proceeding to check for APK.
+         log::warn!("Gradle build step reported issues: {}", e);
+    }
+    
+    // 5. Finalize Artifacts
+    finalize_build_artifact(data, task_id, &project_dir, &file_path).await?;
+    
+    Ok(())
+}
+
+async fn prepare_project_source(data: &Arc<AppState>, task_id: Uuid) -> Result<(String, String), (String, TaskStatus)> {
+    let (file_path, _file_id) = if let Some(task) = data.tasks.get(&task_id) {
+        (task.file_path.clone(), task.file_id.clone())
+    } else {
+        return Err(("Task not found in memory".to_string(), TaskStatus::UnknownError));
+    };
+
+    let mut project_dir = file_path.clone();
+
+    if !std::path::Path::new(&file_path).is_dir() {
+        let file_stem = std::path::Path::new(&file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let unzip_dir = format!("{}/{}", data.upload_dir, file_stem);
+
+        if let Err(e) = fs::create_dir_all(&unzip_dir).await {
+            return Err((format!("Failed to create source dir: {}", e), TaskStatus::CompilationFailed));
+        }
+
+        update_progress(data, task_id, 10, "Extracting project...").await;
+        let file_path_clone = file_path.clone();
+        let unzip_dir_clone = unzip_dir.clone();
+
+        let unzip_result = web::block(move || -> Result<(), std::io::Error> {
+            let file = std::fs::File::open(file_path_clone)?;
+            let mut archive = zip::ZipArchive::new(file)?;
+            use crate::utils::extract_zip_from_archive; 
+            extract_zip_from_archive(&mut archive, &std::path::Path::new(&unzip_dir_clone))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(())
+        }).await;
+
+        match unzip_result {
+            Ok(Ok(_)) => {},
+            _ => {
+                return Err(("Failed to extract project".into(), TaskStatus::CompilationFailed));
+            }
+        }
+        
+        update_progress(data, task_id, 15, "Organizing project files...").await;
+        project_dir = unzip_dir.clone();
+    }
+    
+    Ok((project_dir, file_path))
+}
+
+fn get_compiler_binary_path(tiecc_dir: &str) -> Option<std::path::PathBuf> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let tiecc_root = std::path::Path::new(tiecc_dir);
+
+    let binary_path = match (os, arch) {
+        ("macos", _) => tiecc_root.join("macos/tiec"),
+        ("linux", "x86_64") => tiecc_root.join("linux_x86_64/tiec"),
+        ("linux", "aarch64") => tiecc_root.join("linux_arm64-v8a/tiec"),
+        ("windows", "x86_64") => tiecc_root.join("win_x86_64/tiec.exe"),
+        _ => return None,
+    };
+    
+    if binary_path.exists() { Some(binary_path) } else { None }
+}
+
+async fn run_compiler_process(mut cmd: Command, task_id: Uuid, timeout: u64) -> Result<(), String> {
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn builder: {}", e))?;
+    
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+    
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
+
+    let error_seen = Arc::new(AtomicBool::new(false));
+    let last_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let success_seen = Arc::new(AtomicBool::new(false));
+
+    let success_flag = success_seen.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = stdout_reader.next_line().await {
+           log::info!("[Task {} Stdout]: {}", task_id, line);
+           if line.contains("编译成功") {
+                success_flag.store(true, Ordering::Relaxed);
+           }
+        }
+    });
+
+    let err_flag = error_seen.clone();
+    let err_msg = last_error.clone();
+    let success_flag2 = success_seen.clone();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            log::error!("[Task {} Stderr]: {}", task_id, line);
+            if line.contains("编译成功") {
+                success_flag2.store(true, Ordering::Relaxed);
+            }
+            if line.contains("ERROR") || line.contains("错误") {
+                err_flag.store(true, Ordering::Relaxed);
+                let mut guard = err_msg.lock().await;
+                *guard = Some(line.clone());
+            }
+        }
+    });
+
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout), child.wait()).await {
+        Ok(Ok(status)) => {
+            if error_seen.load(Ordering::Relaxed) {
+                let msg = last_error.lock().await.clone().unwrap_or_else(|| "Compiler error log detected".to_string());
+                return Err(msg);
+            }
+            if status.success() || success_seen.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            Err(format!("Build failed with exit code: {}", status))
+        },
+        Ok(Err(e)) => Err(format!("Wait error: {}", e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err("Build timed out".to_string())
+        }
+    }
+}
+
+async fn run_gradle_build(project_dir: &str) -> Result<(), String> {
+    let gradle_dir_str = format!("{}/build", project_dir);
+    let gradle_dir = std::path::Path::new(&gradle_dir_str);
+    let gradlew_name = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
+    let local_gradlew_build = gradle_dir.join(gradlew_name);
+
+    let (cmd_to_run, work_dir) = if local_gradlew_build.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&local_gradlew_build) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&local_gradlew_build, perms);
+            }
+        }
+        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
+        (cmd, gradle_dir)
+    } else {
+        let system_gradle = match Command::new("gradle").arg("-v").output().await {
+            Ok(_) => "gradle".to_string(),
+            Err(_) => String::new(),
+        };
+        (system_gradle, gradle_dir)
+    };
+
+    if cmd_to_run.is_empty() {
+        return Err("未检测到 Gradle，请安装 Android SDK 和 Gradle".into());
+    }
+
+    let mut gradle_process = Command::new(&cmd_to_run);
+    gradle_process.current_dir(work_dir);
+    gradle_process.arg("assembleRelease");
+    gradle_process.arg("--no-daemon");
+
+    let output = gradle_process.output().await.map_err(|e| format!("Failed to execute gradle: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Gradle build failed: {}", stderr));
+    } else {
+        log::info!("Gradle build success");
+        Ok(())
+    }
+}
+
+async fn finalize_build_artifact(data: &Arc<AppState>, task_id: Uuid, project_dir: &str, file_path_cleanup: &str) -> Result<(), (String, TaskStatus)> {
+    update_progress(data, task_id, 99, "Finalizing package...").await;
+    
+    let build_output_dir = format!("{}/build", project_dir);
+    let gradle_apk_dir = format!("{}/build/outputs/apk", project_dir);
+    
+    let mut apk_path = find_apk_file(&gradle_apk_dir).await;
+    if apk_path.is_none() {
+        apk_path = find_apk_file(&build_output_dir).await;
+    }
+
+    if let Some(apk_file) = apk_path {
+        let apk_path_path = std::path::Path::new(&apk_file);
+        let new_filename = format!("app-{}.apk", task_id);
+        let dest_path_buf = std::path::Path::new(&data.upload_dir).join(&new_filename);
+        let dest_path = dest_path_buf.to_string_lossy().to_string();
+
+        let mut move_success = false;
+        if let Err(e) = tokio::fs::rename(apk_path_path, &dest_path_buf).await {
+            log::warn!("Failed to move APK via rename, trying copy: {}", e);
+            if let Ok(_) = tokio::fs::copy(apk_path_path, &dest_path_buf).await {
+                move_success = true;
+                let _ = tokio::fs::remove_file(apk_path_path).await;
+            }
+        } else {
+            move_success = true;
+        }
+
+        if move_success {
+            if let Some(mut task) = data.tasks.get_mut(&task_id) {
+                task.output_path = Some(dest_path.clone());
+            }
+            update_task_status(data, &task_id, TaskStatus::Success, 100, Some("Build successful".into()), None).await;
+            log::info!("Task {} completed successfully. APK stored at {}", task_id, dest_path);
+
+            let project_dir_cleanup = project_dir.to_string();
+            let zip_file_cleanup = file_path_cleanup.to_string();
+            
+            tokio::spawn(async move {
+                if let Err(e) = tokio::fs::remove_dir_all(&project_dir_cleanup).await {
+                    log::debug!("Cleanup: Failed to remove project dir: {}", e);
+                }
+                let zip_path = std::path::Path::new(&zip_file_cleanup);
+                if zip_path.is_file() {
+                    let _ = tokio::fs::remove_file(zip_path).await;
+                }
+            });
+            Ok(())
+        } else {
+            Err(("Failed to save final APK file".to_string(), TaskStatus::UnknownError))
+        }
+    } else {
+        // Simple file listing for debug
+        Err((format!("Build command succeeded but APK file not found in {}", build_output_dir), TaskStatus::CompilationFailed))
+    }
+}
+
 
 async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step: &str) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
@@ -479,44 +405,8 @@ async fn update_progress(data: &Arc<AppState>, task_id: Uuid, progress: u8, step
 
 async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_status: TaskStatus) {
     if let Some(mut task) = data.tasks.get_mut(&task_id) {
-        // Retry logic:
-        // - Only retry if status is Timeout (transient error) or UnknownError.
-        // - CompilationFailed is treated as fatal and not retryable.
-        let is_retriable = matches!(final_status, TaskStatus::Timeout | TaskStatus::UnknownError);
-        let should_retry = is_retriable && task.retry_count < task.max_retries;
-
-        if should_retry {
-            // Increment retry count
-            task.retry_count += 1;
-            let backoff_secs = compute_retry_delay_seconds(task.retry_count);
-            let next_run_at = Utc::now() + chrono::Duration::seconds(backoff_secs);
-            
-            let retry_reason = if error.is_empty() { "Unknown error".to_string() } else { error.clone() };
-            let retry_msg = format!("Retry {}/{}: scheduled in {}s. Reason: {}", 
-                                    task.retry_count, task.max_retries, backoff_secs, retry_reason);
-            
-            // Update in-memory state
-            task.status = TaskStatus::Queued;
-            task.progress = 0; // Reset progress
-            task.current_step = Some(format!("Waiting for retry (backoff {}s)", backoff_secs));
-            
-            // Set error to indicate it's a transient failure, but keep history
-            task.error = Some(retry_msg.clone());
-            task.updated_at = Utc::now();
-            
-            log::info!("Task {} scheduled for retry (attempt {}/{}) at {} (in {}s)", 
-                       task_id, task.retry_count, task.max_retries, next_run_at, backoff_secs);
-
-            // Update database (schedules retry and clears lease)
-            if let Err(e) = data.database.schedule_retry(&task_id, next_run_at, &retry_msg).await {
-                log::error!("Failed to schedule retry for task {}: {}", task_id, e);
-            }
-            
-            if let Err(e) = data.database.update_task(&task).await {
-                log::error!("Failed to update task retry state for {}: {}", task_id, e);
-            }
-
-        } else {
+        // Retry logic removed - always fail immediately on error
+        {
             // Max retries reached, mark as permanently failed
             log::error!("Task {} failed permanently after {} attempts: {}", task_id, task.max_retries, error);
 
@@ -598,25 +488,30 @@ async fn fail_task(data: &Arc<AppState>, task_id: Uuid, error: String, final_sta
     }
 }
 
-fn compute_retry_delay_seconds(retry_count: u8) -> i64 {
-    let base = 5_i64;
-    let exp = 2_i64.saturating_pow(retry_count as u32);
-    let max_delay = 300_i64;
-    let jitter = (Utc::now().timestamp_subsec_millis() as i64) % 10;
-    (base.saturating_mul(exp)).min(max_delay) + jitter
-}
+// fn compute_retry_delay_seconds(retry_count: u8) -> i64 {
+//     let base = 5_i64;
+//     let exp = 2_i64.saturating_pow(retry_count as u32);
+//     let max_delay = 300_i64;
+//     let jitter = (Utc::now().timestamp_subsec_millis() as i64) % 10;
+//     (base.saturating_mul(exp)).min(max_delay) + jitter
+// }
 
 pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeout: u64, retention_secs: u64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
     loop {
         interval.tick().await;
-        log::info!("正在运行清理任务（保留窗口 {} 秒）", retention_secs);
+        log::info!("正在运行清理任务（文件保留 {} 秒，记录保留 {} 秒）", retention_secs, retention_secs * 3);
 
         let now = chrono::Utc::now();
+        // File cleanup cutoffs
         let completed_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
         let failed_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
         let expired_cutoff = now - chrono::Duration::seconds(retention_secs as i64);
-        let timeout_cutoff = now - chrono::Duration::seconds(task_timeout as i64);
+        
+        // Record cleanup cutoff (hardcoded to 3x retention for now)
+        let record_cutoff = now - chrono::Duration::seconds((retention_secs * 4) as i64);
+        
+        let _timeout_cutoff = now - chrono::Duration::seconds(task_timeout as i64);
 
         let tasks = match data.database.get_all_tasks().await {
             Ok(list) => list,
@@ -627,55 +522,31 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
         };
 
         let mut cleaned = 0usize;
-        let mut timeout_marked = 0usize;
+        let mut _file_cleaned = 0usize;
+        let mut _timeout_marked = 0usize;
         for task in tasks {
-            // 1) 对超时的处理中任务先标记为 Timeout，保留一段时间供查询
-            if task.status == crate::models::TaskStatus::Processing && task.updated_at < timeout_cutoff {
-                let mut updated_task = task.clone();
-                updated_task.status = crate::models::TaskStatus::Timeout;
-                updated_task.error = Some("Build timed out (cleanup)".into());
-                updated_task.current_step = Some("Timeout".into());
-                updated_task.updated_at = chrono::Utc::now();
-
-                if let Some(mut mem_task) = data.tasks.get_mut(&task.task_id) {
-                    mem_task.status = updated_task.status.clone();
-                    mem_task.error = updated_task.error.clone();
-                    mem_task.current_step = updated_task.current_step.clone();
-                    mem_task.updated_at = updated_task.updated_at;
-                }
-
-                if let Err(e) = data.database.update_task(&updated_task).await {
-                    log::warn!("Failed to mark task {} as timeout: {}", task.task_id, e);
-                }
-
-                if let Err(e) = data.database.insert_task_event(
-                    &task.task_id,
-                    "status_change",
-                    Some(crate::models::TaskStatus::Timeout),
-                    Some("Build timed out (cleanup)"),
-                    None,
-                ).await {
-                    log::warn!("Failed to write timeout event for {}: {}", task.task_id, e);
-                }
-
-                // 清理文件（目录与同名 tsp），任务记录暂时保留
-                cleanup_task_files(&data.upload_dir, &updated_task);
-
-                timeout_marked += 1;
+            // 如果任务正在运行，则跳过清理检查
+            if task.status == crate::models::TaskStatus::Processing {
                 continue;
             }
 
-            // 2) 对失败/超时任务，先清理文件，再按保留窗口删除记录
-            if matches!(
-                task.status,
-                crate::models::TaskStatus::UnknownError
-                    | crate::models::TaskStatus::Timeout
-                    | crate::models::TaskStatus::CompilationFailed
-            ) {
+            // 1) Logic for handling timed-out processing tasks is removed as per request to skip running tasks.
+
+            // 2) 彻底清理：如果超过记录保留时间，删除数据库记录和内存缓存
+            if task.updated_at < record_cutoff {
                 cleanup_task_files(&data.upload_dir, &task);
+                data.tasks.remove(&task.task_id);
+                if let Err(e) = data.database.delete_task(&task.task_id).await {
+                    log::error!("Failed to delete task {}: {}", task.task_id, e);
+                } else {
+                    cleaned += 1;
+                    log::info!("已彻底清理古老任务（记录+文件）：{}", task.task_id);
+                }
+                continue;
             }
 
-            let should_cleanup = match task.status {
+            // 3) 文件清理：如果超过文件保留时间，仅清理物理文件，保留记录
+            let should_cleanup_files = match task.status {
                 crate::models::TaskStatus::Success => task.updated_at < completed_cutoff,
                 crate::models::TaskStatus::UnknownError => task.updated_at < failed_cutoff,
                 crate::models::TaskStatus::Timeout => task.updated_at < failed_cutoff,
@@ -685,23 +556,21 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
                 crate::models::TaskStatus::Processing => false,
             };
 
-            if !should_cleanup {
-                continue;
+            if should_cleanup_files {
+                 // Check if files exist before trying to clean to avoid Spamming logs or useless ops
+                 let file_path = std::path::Path::new(&task.file_path);
+                 let output_path = task.output_path.as_deref().map(std::path::Path::new);
+                 let has_files = file_path.exists() || output_path.map(|p| p.exists()).unwrap_or(false);
+                 
+                 if has_files {
+                     cleanup_task_files(&data.upload_dir, &task);
+                     _file_cleaned += 1;
+                     log::info!("已清理过期任务文件（保留记录）：{}", task.task_id);
+                 }
             }
-
-            cleanup_task_files(&data.upload_dir, &task);
-
-            data.tasks.remove(&task.task_id);
-            if let Err(e) = data.database.delete_task(&task.task_id).await {
-                log::error!("Failed to delete task {}: {}", task.task_id, e);
-                continue;
-            }
-
-            cleaned += 1;
-            log::info!("已清理过期/超时任务：{}", task.task_id);
         }
 
-        if cleaned > 0 || timeout_marked > 0 {
+        if cleaned > 0 || _timeout_marked > 0 {
             if let Ok((total, completed, failed, _)) = data.database.get_task_stats().await {
                 data.total_tasks.store(total, std::sync::atomic::Ordering::Relaxed);
                 data.completed_tasks.store(completed, std::sync::atomic::Ordering::Relaxed);
