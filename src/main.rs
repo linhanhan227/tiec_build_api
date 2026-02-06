@@ -433,6 +433,9 @@ fn configure_build_test_environment(config: &Option<BuildTestConfig>) {
     }
     
     // Set defaults if not provided in config
+    if config.as_ref().and_then(|cfg| cfg.task_timeout).is_none() {
+        std::env::set_var("TASK_TIMEOUT", "1800");
+    }
     if config.as_ref().and_then(|cfg| cfg.cleanup_interval).is_none() {
         std::env::set_var("CLEANUP_INTERVAL", "86400");
     }
