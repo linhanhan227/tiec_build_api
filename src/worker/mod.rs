@@ -533,7 +533,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
 
             // 2) 彻底清理：如果超过记录保留时间，删除数据库记录和内存缓存
             if task.updated_at < record_cutoff {
-                cleanup_task_files(&data.upload_dir, &task);
+                cleanup_task_files(&data.upload_dir, &task).await;
                 data.tasks.remove(&task.task_id);
                 if let Err(e) = data.database.delete_task(&task.task_id).await {
                     log::error!("Failed to delete task {}: {}", task.task_id, e);
@@ -562,7 +562,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
                  let has_files = file_path.exists() || output_path.map(|p| p.exists()).unwrap_or(false);
                  
                  if has_files {
-                     cleanup_task_files(&data.upload_dir, &task);
+                     cleanup_task_files(&data.upload_dir, &task).await;
                      _file_cleaned += 1;
                      log::info!("已清理过期任务文件（保留记录）：{}", task.task_id);
                  }
@@ -579,7 +579,7 @@ pub async fn cleanup_task(data: Arc<AppState>, cleanup_interval: u64, task_timeo
     }
 }
 
-fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
+async fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     let file_path = std::path::Path::new(&task.file_path);
     let stem = file_path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
     
@@ -588,14 +588,18 @@ fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     // But since remove methods fail if not exists, we can just check existence.
     // Importantly, we capture is_dir before deletion if possible, but if it doesn't exist we guess based on extension or just skip logic that depends on type.
     if file_path.exists() {
-        if file_path.is_dir() {
-            if let Err(e) = std::fs::remove_dir_all(file_path) {
-                log::warn!("Failed to remove task dir {}: {}", file_path.display(), e);
-            }
+        let res = if file_path.is_dir() {
+            tokio::fs::remove_dir_all(file_path).await
         } else {
-             if let Err(e) = std::fs::remove_file(file_path) {
-                log::warn!("Failed to remove task file {}: {}", file_path.display(), e);
-            }
+            tokio::fs::remove_file(file_path).await
+        };
+        
+        if let Err(e) = res {
+             if cfg!(windows) && e.raw_os_error() == Some(32) {
+                 log::debug!("Skip cleaning {} (locked by another process)", file_path.display());
+             } else {
+                 log::warn!("Failed to remove task file/dir {}: {}", file_path.display(), e);
+             }
         }
     } else {
         // Log that file was missing, might have been cleaned up already
@@ -606,10 +610,13 @@ fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     if let Some(output_path) = task.output_path.as_ref() {
         let output = std::path::Path::new(output_path);
         if output.exists() {
-            if output.is_dir() {
-                let _ = std::fs::remove_dir_all(output);
+            let res = if output.is_dir() {
+                tokio::fs::remove_dir_all(output).await
             } else {
-                let _ = std::fs::remove_file(output);
+                tokio::fs::remove_file(output).await
+            };
+            if let Err(e) = res {
+                log::warn!("Failed to remove output {}: {}", output.display(), e);
             }
         }
     }
@@ -620,8 +627,12 @@ fn cleanup_task_files(upload_dir: &str, task: &crate::models::Task) {
     if let Some(stem_str) = stem {
          let extracted_dir = std::path::Path::new(upload_dir).join(format!("{}", stem_str));
          if extracted_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&extracted_dir) {
-                log::warn!("Failed to remove extracted dir {}: {}", extracted_dir.display(), e);
+            if let Err(e) = tokio::fs::remove_dir_all(&extracted_dir).await {
+                if cfg!(windows) && e.raw_os_error() == Some(32) {
+                    log::debug!("Skip cleaning extracted dir {} (locked)", extracted_dir.display());
+                } else {
+                    log::warn!("Failed to remove extracted dir {}: {}", extracted_dir.display(), e);
+                }
             }
          }
     }
