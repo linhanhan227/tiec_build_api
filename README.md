@@ -61,7 +61,13 @@ cargo build --release
 ./target/release/tie_api_server
 ```
 
-如需自定义端口或路径，可通过环境变量启动：
+也可通过命令行参数指定端口：
+
+```bash
+./target/release/tie_api_server --port 9090
+```
+
+如需自定义更多配置，可通过环境变量启动：
 
 ```bash
 HOST=127.0.0.1 PORT=8081 UPLOAD_DIR=./.tiec/uploads DATABASE_PATH=./.tiec/tasks.db \

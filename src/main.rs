@@ -446,7 +446,16 @@ fn configure_build_test_environment(config: &Option<BuildTestConfig>) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let build_test = std::env::args().any(|arg| arg == "--build-test" || arg == "build-test");
+    let args: Vec<String> = std::env::args().collect();
+    let build_test = args.iter().any(|arg| arg == "--build-test" || arg == "build-test");
+
+    // Check for --port argument
+    if let Some(index) = args.iter().position(|arg| arg == "--port") {
+        if let Some(port) = args.get(index + 1) {
+            std::env::set_var("PORT", port);
+        }
+    }
+
     let build_test_config = if build_test {
         load_build_test_config()
     } else {
