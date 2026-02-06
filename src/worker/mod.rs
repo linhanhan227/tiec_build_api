@@ -318,6 +318,10 @@ async fn run_gradle_build(project_dir: &str) -> Result<(), String> {
     let mut gradle_process = Command::new(&cmd_to_run);
     gradle_process.current_dir(work_dir);
     gradle_process.arg("assembleRelease");
+    gradle_process.arg("-x");
+    gradle_process.arg("lint");
+    gradle_process.arg("-x");
+    gradle_process.arg("lintVitalRelease");
     gradle_process.arg("--no-daemon");
 
     let output = gradle_process.output().await.map_err(|e| format!("Failed to execute gradle: {}", e))?;
