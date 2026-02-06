@@ -152,10 +152,8 @@ async fn execute_task(data: &Arc<AppState>, task_id: Uuid, task_timeout: u64) ->
     // 4. Run Gradle Packaging
     update_progress(data, task_id, 80, "Packaging APK (release)...").await;
     if let Err(e) = run_gradle_build(&project_dir).await {
-         // Gradle errors are non-fatal in the original code sense if an apk is somehow found?
-         // But usually failure means no APK. The original code logged warning and continued to find_apk.
-         // We'll mimic that structure by just logging but proceeding to check for APK.
-         log::warn!("Gradle build step reported issues: {}", e);
+         // Gradle failure is now fatal since we depend on it for APK generation
+         return Err((format!("Gradle packaging failed: {}", e), TaskStatus::CompilationFailed));
     }
     
     // 5. Finalize Artifacts
@@ -307,8 +305,15 @@ async fn run_gradle_build(project_dir: &str) -> Result<(), String> {
         }
     }
 
-    let cmd_to_run = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
+    let cmd_to_run = if cfg!(windows) {
+         // Windows: use absolute path to avoid "program not found" if current_dir is set
+         local_gradlew_build.to_string_lossy().to_string()
+    } else {
+         format!("./{}", gradlew_name)
+    };
     let work_dir = gradle_dir;
+
+    log::info!("Executing gradle command: {} in {}", cmd_to_run, work_dir.display());
 
     let mut gradle_process = Command::new(&cmd_to_run);
     gradle_process.current_dir(work_dir);
