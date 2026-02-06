@@ -292,29 +292,23 @@ async fn run_gradle_build(project_dir: &str) -> Result<(), String> {
     let gradlew_name = if cfg!(windows) { "gradlew.bat" } else { "gradlew" };
     let local_gradlew_build = gradle_dir.join(gradlew_name);
 
-    let (cmd_to_run, work_dir) = if local_gradlew_build.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&local_gradlew_build) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&local_gradlew_build, perms);
-            }
-        }
-        let cmd = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
-        (cmd, gradle_dir)
-    } else {
-        let system_gradle = match Command::new("gradle").arg("-v").output().await {
-            Ok(_) => "gradle".to_string(),
-            Err(_) => String::new(),
-        };
-        (system_gradle, gradle_dir)
-    };
-
-    if cmd_to_run.is_empty() {
-        return Err("未检测到 Gradle，请安装 Android SDK 和 Gradle".into());
+    // 强制使用项目自带的 gradlew
+    if !local_gradlew_build.exists() {
+        return Err(format!("未在构建目录检测到 {}，请确保项目生成了 Gradle Wrapper", gradlew_name));
     }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&local_gradlew_build) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&local_gradlew_build, perms);
+        }
+    }
+
+    let cmd_to_run = if cfg!(windows) { gradlew_name.to_string() } else { format!("./{}", gradlew_name) };
+    let work_dir = gradle_dir;
 
     let mut gradle_process = Command::new(&cmd_to_run);
     gradle_process.current_dir(work_dir);
