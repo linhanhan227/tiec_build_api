@@ -95,10 +95,10 @@ http://localhost:8080/swagger-ui/
 	"file_path": "./demo.tsp",
 	"file_paths": ["./demo1.tsp", "./demo2.tsp"],
 	"interval_ms": 200,
-	"task_timeout": 900,
+	"task_timeout": 1800,
 	"queue_capacity": 30,
-	"cleanup_interval": 30,
-	"cleanup_retention_secs": 15,
+	"cleanup_interval": 86400,
+	"cleanup_retention_secs": 86400,
 	"hourly_ip_limit": 60,
 	"max_retries": 3
 }
@@ -116,11 +116,11 @@ http://localhost:8080/swagger-ui/
 | DATABASE_PATH | ./.tiec/tasks.db | SQLite 数据库路径 |
 | QUEUE_CAPACITY | 15 | 队列容量 |
 | WORKER_COUNT | 1 | Worker 数量 |
-| TASK_TIMEOUT | 900 | 单任务超时（秒） |
-| CLEANUP_INTERVAL | 3600 | 清理任务间隔（秒） |
-| CLEANUP_RETENTION_SECS | 3600 | 清理保留窗口（秒） |
+| TASK_TIMEOUT | 1800 | 单任务超时（秒），默认 30 分钟 |
+| CLEANUP_INTERVAL | 86400 | 清理任务间隔（秒），默认 24 小时 |
+| CLEANUP_RETENTION_SECS | 86400 | 清理保留窗口（秒），默认 24 小时 |
 | HOURLY_IP_LIMIT | 20 | 每 IP 每小时限制（仅对上传/构建相关接口生效） |
-| MAX_RETRIES | 3 | 失败重试次数上限 |
+| MAX_RETRIES | 0 | 失败重试次数上限 |
 
 ## 运行时目录/文件
 
@@ -150,8 +150,6 @@ http://localhost:8080/swagger-ui/
 ## 文档
 
 - [API文档.md](API文档.md)
-- [项目完整文档.md](项目完整文档.md)
-- [代码深度解析.md](代码深度解析.md)
 
 同时提供 OpenAPI JSON：
 

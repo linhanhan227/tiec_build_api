@@ -440,11 +440,11 @@ curl http://localhost:8080/api-docs/openapi.json
 | DATABASE_PATH | ./.tiec/tasks.db | SQLite 数据库路径 |
 | QUEUE_CAPACITY | 15 | 队列容量 |
 | WORKER_COUNT | 1 | 工作线程数 |
-| TASK_TIMEOUT | 900 | 单任务超时（秒） |
-| CLEANUP_INTERVAL | 3600 | 清理任务间隔（秒） |
+| TASK_TIMEOUT | 1800 | 单任务超时（秒） |
+| CLEANUP_INTERVAL | 86400 | 清理任务间隔（秒） |
 | CLEANUP_RETENTION_SECS | 86400 | 清理时保留多久内的过期任务（秒） |
 | HOURLY_IP_LIMIT | 20 | 每 IP 每小时限制（仅限部分 API） |
-| MAX_RETRIES | 3 | 任务最大重试次数 |
+| MAX_RETRIES | 0 | 任务最大重试次数 |
 
 ### build-test 测试参数（可选）
 
@@ -458,10 +458,10 @@ build-test 通过 **真实 API 流程**（/api/v1/upload、/api/v1/build）测�
 	"file_path": "./demo.tsp",
 	"file_paths": ["./demo1.tsp", "./demo2.tsp"],
 	"interval_ms": 200,
-	"task_timeout": 900,
+	"task_timeout": 1800,
 	"queue_capacity": 30,
-	"cleanup_interval": 30,
-	"cleanup_retention_secs": 15,
+	"cleanup_interval": 86400,
+	"cleanup_retention_secs": 86400,
 	"hourly_ip_limit": 60,
     "max_retries": 3
 }

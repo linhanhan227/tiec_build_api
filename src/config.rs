@@ -28,13 +28,13 @@ impl Config {
                 .parse()
                 .unwrap_or(1),
             task_timeout: std::env::var("TASK_TIMEOUT")
-                .unwrap_or_else(|_| "1200".into())
+                .unwrap_or_else(|_| "1800".into())
                 .parse()
-                .unwrap_or(1200),
+                .unwrap_or(1800),
             cleanup_interval: std::env::var("CLEANUP_INTERVAL")
-                .unwrap_or_else(|_| "3600".into())
+                .unwrap_or_else(|_| "86400".into())
                 .parse()
-                .unwrap_or(3600),
+                .unwrap_or(86400),
             cleanup_retention_secs: std::env::var("CLEANUP_RETENTION_SECS")
                 .unwrap_or_else(|_| "86400".into())
                 .parse()

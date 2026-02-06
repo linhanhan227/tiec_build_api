@@ -19,6 +19,7 @@ use database::Database;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use std::sync::{Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 #[cfg(not(windows))]
 use std::net::IpAddr;
@@ -274,6 +275,13 @@ async fn run_build_test_via_api(base_url: String, file_paths: Vec<String>, inter
         match resp.json::<ApiResponse<BuildData>>().await {
             Ok(payload) => {
                 log::info!("build-test：已创建构建任务 {}（状态：{:?}）", payload.data.task_id, payload.data.status);
+                
+                let mon_client = client.clone();
+                let mon_base = base_url.clone();
+                let mon_task = payload.data.task_id.clone();
+                tokio::spawn(async move {
+                    monitor_build_task(mon_client, mon_base, mon_task).await;
+                });
             }
             Err(e) => {
                 log::error!("build-test：解析构建响应失败（第 {} 个）: {}", idx + 1, e);
@@ -281,6 +289,95 @@ async fn run_build_test_via_api(base_url: String, file_paths: Vec<String>, inter
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+    }
+}
+
+async fn monitor_build_task(client: reqwest::Client, base_url: String, task_id: String) {
+    let status_url = format!("{}/api/v1/build/{}/status", base_url.trim_end_matches('/'), task_id);
+    let events_url = format!("{}/api/v1/build/{}/events", base_url.trim_end_matches('/'), task_id);
+    let download_url = format!("{}/api/v1/build/{}/download", base_url.trim_end_matches('/'), task_id);
+
+    log::info!("build-test：监控任务 {} (API: status/events/download)", task_id);
+
+    let running = Arc::new(AtomicBool::new(true));
+    
+    // 1. Independent Event Polling Task
+    let events_client = client.clone();
+    let events_task_id = task_id.clone();
+    let events_running = running.clone();
+    
+    let _event_handle = tokio::spawn(async move {
+        while events_running.load(Ordering::Relaxed) {
+            match events_client.get(&events_url).send().await {
+                Ok(resp) => {
+                     if let Ok(payload) = resp.json::<ApiResponse<Vec<models::TaskEvent>>>().await {
+                         if let Some(last) = payload.data.last() {
+                             log::info!("build-test：任务 {} 事件 -> [{}] {}", events_task_id, last.event_type, last.message.as_deref().unwrap_or(""));
+                         }
+                     }
+                },
+                Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+
+    let mut final_status = models::TaskStatus::Queued;
+    
+    // 2. Status Polling Loop (Main monitor flow)
+    for _ in 0..600 {
+        let resp = match client.get(&status_url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("build-test：获取任务 {} 状态失败: {}", task_id, e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+        
+        if let Ok(payload) = resp.json::<ApiResponse<models::Task>>().await {
+             match payload.data.status {
+                models::TaskStatus::Success => {
+                    log::info!("build-test：任务 {} 构建成功！", task_id);
+                    final_status = models::TaskStatus::Success;
+                    break;
+                },
+                models::TaskStatus::CompilationFailed | models::TaskStatus::Timeout | models::TaskStatus::Cancelled | models::TaskStatus::UnknownError => {
+                    log::error!("build-test：任务 {} 结束但失败，状态: {:?}", task_id, payload.data.status);
+                    final_status = payload.data.status;
+                    break;
+                },
+                _ => {}
+             }
+        }
+        
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    // Stop event polling
+    running.store(false, Ordering::Relaxed);
+    // We don't necessarily need to wait for event_handle to finish, it will stop on next tick.
+
+    // 3. Independent Download Task (if success)
+    if final_status == models::TaskStatus::Success {
+        tokio::spawn(async move {
+            log::info!("build-test：正在下载 APK (任务 {}) ...", task_id);
+            match client.get(&download_url).send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        let len = resp.content_length().unwrap_or(0);
+                        log::info!("build-test：下载测试通过！任务: {}, 大小: {} bytes", task_id, len);
+                    } else {
+                        log::error!("build-test：下载请求返回异常状态 {}: {}", task_id, resp.status());
+                    }
+                },
+                Err(e) => {
+                    log::error!("build-test：下载请求失败 {}: {}", task_id, e);
+                }
+            }
+        });
+        // We spawn download detached so this monitor function can return (freeing up the logical 'monitor' slot if we track them)
+        // Check if event_handle needs to be awaited? No, detached is fine.
     }
 }
 
@@ -337,10 +434,10 @@ fn configure_build_test_environment(config: &Option<BuildTestConfig>) {
     
     // Set defaults if not provided in config
     if config.as_ref().and_then(|cfg| cfg.cleanup_interval).is_none() {
-        std::env::set_var("CLEANUP_INTERVAL", "30");
+        std::env::set_var("CLEANUP_INTERVAL", "86400");
     }
     if config.as_ref().and_then(|cfg| cfg.cleanup_retention_secs).is_none() {
-        std::env::set_var("CLEANUP_RETENTION_SECS", "15");
+        std::env::set_var("CLEANUP_RETENTION_SECS", "86400");
     }
 }
 
